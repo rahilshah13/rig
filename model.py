@@ -37,29 +37,12 @@ bone_parents = {
 
 app = FastAPI()
 
-initial_default_batch = [
-    {
-        "id": 1, "mass": 75.0, "height": 1.75,
-        "bone_transforms": {b: {"freq": 1.5, "amp": 0.3, "axis": "x"} for b in SKELETAL_BONES},
-        "preview_url": None
-    },
-    {
-        "id": 2, "mass": 80.0, "height": 1.80,
-        "bone_transforms": {b: {"freq": 2.0, "amp": 0.4, "axis": "y"} for b in SKELETAL_BONES},
-        "preview_url": None
-    },
-    {
-        "id": 3, "mass": 70.0, "height": 1.70,
-        "bone_transforms": {b: {"freq": 1.0, "amp": 0.2, "axis": "z"} for b in SKELETAL_BONES},
-        "preview_url": None
-    }
-]
-
 frontend_state = {
-    "current_batch": initial_default_batch,
+    "current_batch": [],
     "latest_scores": [],
     "waiting_for_human": True,
-    "epoch": 1
+    "epoch": 1,
+    "status_message": "Initializing JAX diffusion environment..."
 }
 
 rms_norm = lambda x, scale, eps=1e-5: x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps) * scale
@@ -154,7 +137,8 @@ def get_or_create_init_seed(default_seed=42):
 def get_current_batch():
     return JSONResponse({
         "epoch": frontend_state["epoch"],
-        "batch": frontend_state["current_batch"]
+        "batch": frontend_state["current_batch"],
+        "status": frontend_state["status_message"]
     })
 
 @app.post("/api/score")
@@ -166,10 +150,16 @@ async def submit_human_scores(request: Request):
     frontend_state["waiting_for_human"] = False
     return {"status": "success", "received_scores": scores}
 
+@app.get("/gif/{filename}")
+def serve_gif(filename: str):
+    file_path = os.path.join(".", filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="image/gif")
+    return JSONResponse({"error": "GIF not found"}, status_code=404)
+
 os.makedirs("frontend/dist/assets", exist_ok=True)
 if os.path.exists("frontend/dist/assets"):
     app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="frontend_assets")
-app.mount("/root_assets", StaticFiles(directory="."), name="root_assets")
 
 @app.get("/")
 def serve_index():
@@ -178,6 +168,7 @@ def serve_index():
     return JSONResponse({"status": "error", "message": "Frontend not built or index.html missing"}, status_code=504)
 
 def evaluate_batch_with_human_feedback(params, batch_size=3):
+    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Running JAX diffusion forward pass..."
     print(f"\n[RL Env] Evaluating batch of {batch_size} generated bone-level rigging variations...")
     
     dummy_conditions = (
@@ -192,9 +183,9 @@ def evaluate_batch_with_human_feedback(params, batch_size=3):
     output = gpt_forward(params, dummy_input, dummy_conditions, modality_type="audio")
     
     batch_metadata = []
+    # Pre-populate placeholder items so the UI shows cards instantly while GIFs render incrementally
     for i in range(batch_size):
         p = output[i, 0, :]
-        
         bone_transforms = {}
         param_idx = 0
         for bone in SKELETAL_BONES:
@@ -202,18 +193,31 @@ def evaluate_batch_with_human_feedback(params, batch_size=3):
             amp = float(jnp.abs(p[param_idx + 1]) * 0.6 + 0.1) if param_idx + 1 < p.shape[0] else 0.3
             axis_val = float(p[param_idx + 2]) if param_idx + 2 < p.shape[0] else 0.0
             axis = 'x' if axis_val < -0.33 else ('y' if axis_val > 0.33 else 'z')
-            
             bone_transforms[bone] = {"freq": round(freq, 2), "amp": round(amp, 2), "axis": axis}
             param_idx += 3
 
         mass = float(jnp.abs(p[param_idx]) * 50.0 + 50.0) if param_idx < p.shape[0] else 75.0
         height = float(jnp.abs(p[param_idx + 1]) * 0.5 + 1.5) if param_idx + 1 < p.shape[0] else 1.75
 
+        batch_metadata.append({
+            "id": i + 1,
+            "mass": round(mass, 1),
+            "height": round(height, 2),
+            "bone_transforms": bone_transforms,
+            "preview_url": None
+        })
+
+    frontend_state["current_batch"] = batch_metadata
+
+    # Render each variation incrementally so status updates in real-time
+    for i in range(batch_size):
+        item = batch_metadata[i]
+        frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Rendering mesh GIF {i+1} of {batch_size}..."
+        
         scene_ast = []
         for bone in SKELETAL_BONES:
             parent = bone_parents.get(bone)
-            bt = bone_transforms[bone]
-            
+            bt = item["bone_transforms"][bone]
             node = {
                 "bone": bone,
                 "parent": parent,
@@ -228,28 +232,24 @@ def evaluate_batch_with_human_feedback(params, batch_size=3):
         with open(json_path, "w") as f:
             json.dump(scene_ast, f, indent=2)
 
-        gif_filename = f"rigged_scene_var_{i+1}.gif"
+        gif_filename = f"rigged_scene_var_{i+1}_epoch_{frontend_state['epoch']}.gif"
         try:
-            scene_map = rig.generate_parametric_human(mass_kg=mass, height_m=height)
+            scene_map = rig.generate_parametric_human(mass_kg=item["mass"], height_m=item["height"])
             rig.parse_and_apply_json_ast(json_path, scene_map)
             time_steps = np.linspace(0, 5.0, 150)
             rig.process_rigging_scene(scene_map, time_steps, output_filename=gif_filename)
+            if os.path.exists(gif_filename):
+                item["preview_url"] = f"/gif/{gif_filename}"
         except Exception as e:
             print(f"Simulation render error on variation {i+1}: {e}")
-            gif_filename = ""
-                    
-        batch_metadata.append({
-            "id": i + 1,
-            "mass": round(mass, 1),
-            "height": round(height, 2),
-            "bone_transforms": bone_transforms,
-            "preview_url": f"/{gif_filename}" if os.path.exists(gif_filename) else None
-        })
 
-    frontend_state["current_batch"] = batch_metadata
+        # Push incremental update to frontend state
+        frontend_state["current_batch"] = list(batch_metadata)
+
     frontend_state["waiting_for_human"] = True
+    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Waiting for human RLHF scoring..."
     
-    print("\n>>> Waiting for human RLHF scores from the SolidJS Dashboard at http://localhost:8000 ...")
+    print(f"\n>>> Waiting for human RLHF scores for Epoch {frontend_state['epoch']}...")
     while frontend_state["waiting_for_human"]:
         time.sleep(0.5)
         

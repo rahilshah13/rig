@@ -90,36 +90,35 @@ function RigCanvas(props) {
 }
 
 function App() {
-  const [batchData, setBatchData] = createSignal({ epoch: 1, batch: [] });
+  const [batchData, setBatchData] = createSignal({ epoch: 1, batch: [], status: "Initializing..." });
   const [scores, setScores] = createSignal({});
-  const [loading, setLoading] = createSignal(true);
 
   const fetchBatch = async () => {
     try {
       const res = await fetch("/api/batch");
       const data = await res.json();
-      if (data && data.batch && data.batch.length > 0) {
+      if (data) {
         setBatchData(data);
-        const initialScores = {};
-        data.batch.forEach(item => {
-          if (scores()[item.id] === undefined) {
-            initialScores[item.id] = 0.5;
-          } else {
-            initialScores[item.id] = scores()[item.id];
-          }
-        });
-        setScores(initialScores);
-        setLoading(false);
+        if (data.batch && data.batch.length > 0) {
+          const initialScores = {};
+          data.batch.forEach(item => {
+            if (scores()[item.id] === undefined) {
+              initialScores[item.id] = 0.5;
+            } else {
+              initialScores[item.id] = scores()[item.id];
+            }
+          });
+          setScores(initialScores);
+        }
       }
     } catch (err) {
-      console.error("Waiting for backend batch generation...", err);
+      console.error("Waiting for backend status...", err);
     }
   };
 
   onMount(() => {
     fetchBatch();
-    // Continuous background poll to grab rendered GIF preview URLs as soon as background thread finishes
-    const interval = setInterval(fetchBatch, 2000);
+    const interval = setInterval(fetchBatch, 1500);
     onCleanup(() => clearInterval(interval));
   });
 
@@ -137,19 +136,26 @@ function App() {
       body: JSON.stringify({ scores: scoreList })
     });
     
-    setBatchData({ epoch: batchData().epoch + 1, batch: [] });
+    setBatchData({ ...batchData(), status: "Submitting scores to JAX trainer..." });
   };
 
   return (
     <div style="font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 40px 20px; box-sizing: border-box;">
       <div style="width: 100%; max-width: 1200px; display: flex; flex-direction: column; align-items: center; text-align: center;">
         <h1 style="font-size: 28px; font-weight: 700; color: #0f172a; margin-bottom: 8px;">Rig Environment - Human-in-the-Loop Scoring Dashboard</h1>
-        <p style="font-size: 16px; color: #64748b; margin-bottom: 24px;">Training Epoch: <strong style="color: #2563eb;">{batchData().epoch}</strong></p>
+        <p style="font-size: 16px; color: #64748b; margin-bottom: 8px;">Training Epoch: <strong style="color: #2563eb;">{batchData().epoch}</strong></p>
         
-        {loading() && batchData().batch.length === 0 ? (
+        {/* Live Status Progress Banner */}
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; margin-bottom: 24px; display: flex; align-items: center; gap: 8px;">
+          <div style="width: 8px; height: 8px; background: #2563eb; border-radius: 50%; animation: pulse 1.5s infinite;"></div>
+          <span>Status: {batchData().status}</span>
+        </div>
+        <style>{`@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }`}</style>
+        
+        {batchData().batch.length === 0 ? (
           <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); width: 100%; margin-top: 20px;">
             <div style="width: 44px; height: 44px; border: 4px solid #e2e8f0; border-top-color: #2563eb; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
-            <p style="font-size: 16px; color: #475569; font-weight: 500;">Rendering procedural variations & GLB GIFs in backend... Please wait.</p>
+            <p style="font-size: 16px; color: #475569; font-weight: 500;">Generating procedural variations & rendering GIFs...</p>
             <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
           </div>
         ) : (
@@ -171,7 +177,7 @@ function App() {
                         {item.preview_url ? (
                           <img src={item.preview_url} alt="Mesh Render" style="width: 160px; height: 200px; object-fit: contain; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
                         ) : (
-                          <div style="width: 160px; height: 200px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 12px; border: 1px solid #e2e8f0;">Rendering...</div>
+                          <div style="width: 160px; height: 200px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 12px; border: 1px solid #e2e8f0; text-align: center; padding: 10px;">Rendering in progress...</div>
                         )}
                       </div>
                     </div>
