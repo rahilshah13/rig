@@ -30,8 +30,8 @@ function RigCanvas(props) {
       ctx.clearRect(0, 0, canvasRef.width, canvasRef.height);
 
       ctx.save();
-      ctx.translate(canvasRef.width / 2, canvasRef.height / 2 + 20);
-      ctx.scale(1, -1);
+      ctx.translate(canvasRef.width / 2, canvasRef.height / 2 + 15);
+      ctx.scale(0.8, -0.8);
 
       const transforms = props.transforms || {};
       const computedPositions = {};
@@ -41,7 +41,7 @@ function RigCanvas(props) {
         const cfg = transforms[bone] || { freq: 1.0, amp: 0.2, axis: 'x' };
         
         let dx = 0, dy = 0, dz = 0;
-        const oscillation = Math.sin(2 * Math.PI * cfg.freq * t) * cfg.amp * 25;
+        const oscillation = Math.sin(2 * Math.PI * cfg.freq * t) * cfg.amp * 20;
         
         if (cfg.axis === 'x') dx = oscillation;
         else if (cfg.axis === 'y') dy = oscillation;
@@ -50,7 +50,7 @@ function RigCanvas(props) {
         computedPositions[bone] = [base[0] + dx, base[1] + dy, base[2] + dz];
       });
 
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = 2;
       ctx.strokeStyle = "#2563eb";
       ctx.fillStyle = "#1e293b";
 
@@ -70,7 +70,7 @@ function RigCanvas(props) {
       Object.keys(computedPositions).forEach(bone => {
         const p = computedPositions[bone];
         ctx.beginPath();
-        ctx.arc(p[0], p[1], 3.5, 0, 2 * Math.PI);
+        ctx.arc(p[0], p[1], 3, 0, 2 * Math.PI);
         ctx.fill();
         ctx.stroke();
       });
@@ -85,7 +85,7 @@ function RigCanvas(props) {
   onCleanup(() => cancelAnimationFrame(animationFrameId));
 
   return (
-    <canvas ref={canvasRef} width="160" height="200" style="background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
+    <canvas ref={canvasRef} width="120" height="150" style="background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
   );
 }
 
@@ -136,13 +136,13 @@ function App() {
       body: JSON.stringify({ scores: scoreList })
     });
     
-    setBatchData({ ...batchData(), status: "Submitting scores to JAX trainer..." });
+    setBatchData({ ...batchData(), status: "Submitting 20 scores to JAX trainer..." });
   };
 
   return (
     <div style="font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 40px 20px; box-sizing: border-box;">
-      <div style="width: 100%; max-width: 1200px; display: flex; flex-direction: column; align-items: center; text-align: center;">
-        <h1 style="font-size: 28px; font-weight: 700; color: #0f172a; margin-bottom: 8px;">Rig Environment - Human-in-the-Loop Scoring Dashboard</h1>
+      <div style="width: 100%; max-width: 1400px; display: flex; flex-direction: column; align-items: center; text-align: center;">
+        <h1 style="font-size: 28px; font-weight: 700; color: #0f172a; margin-bottom: 8px;">Rig Environment - 20-Variation Human-in-the-Loop Scoring Dashboard</h1>
         <p style="font-size: 16px; color: #64748b; margin-bottom: 8px;">Training Epoch: <strong style="color: #2563eb;">{batchData().epoch}</strong></p>
         
         {/* Live Status Progress Banner */}
@@ -155,46 +155,46 @@ function App() {
         {batchData().batch.length === 0 ? (
           <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); width: 100%; margin-top: 20px;">
             <div style="width: 44px; height: 44px; border: 4px solid #e2e8f0; border-top-color: #2563eb; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
-            <p style="font-size: 16px; color: #475569; font-weight: 500;">Generating procedural variations & rendering GIFs...</p>
+            <p style="font-size: 16px; color: #475569; font-weight: 500;">Generating 20 procedural variations via Trealla Prolog & JAX...</p>
             <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
           </div>
         ) : (
           <div style="width: 100%; display: flex; flex-direction: column; align-items: center;">
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 24px; width: 100%; margin-bottom: 32px;">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; width: 100%; margin-bottom: 32px;">
               <For each={batchData().batch}>
                 {(item) => (
-                  <div style="background: #ffffff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); display: flex; flex-direction: column; align-items: center; text-align: left; border: 1px solid #e2e8f0;">
-                    <h3 style="font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 4px; width: 100%;">Variation #{item.id}</h3>
-                    <p style="font-size: 13px; color: #64748b; margin-bottom: 14px; width: 100%;">Mass: {item.mass}kg | Height: {item.height}m</p>
+                  <div style="background: #ffffff; padding: 14px; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); display: flex; flex-direction: column; align-items: center; text-align: left; border: 1px solid #e2e8f0;">
+                    <h3 style="font-size: 16px; font-weight: 600; color: #1e293b; margin-bottom: 2px; width: 100%;">Var #{item.id}</h3>
+                    <p style="font-size: 12px; color: #64748b; margin-bottom: 10px; width: 100%;">Mass: {item.mass}kg | H: {item.height}m</p>
                     
-                    <div style="display: flex; gap: 12px; width: 100%; justify-content: center; align-items: center; margin-bottom: 16px;">
+                    <div style="display: flex; gap: 8px; width: 100%; justify-content: center; align-items: center; margin-bottom: 12px;">
                       <div style="display: flex; flex-direction: column; align-items: center;">
-                        <span style="font-size: 11px; font-weight: 600; color: #64748b; margin-bottom: 4px;">Raw Bone Rig</span>
+                        <span style="font-size: 10px; font-weight: 600; color: #64748b; margin-bottom: 2px;">Bone Rig</span>
                         <RigCanvas transforms={item.bone_transforms} />
                       </div>
                       <div style="display: flex; flex-direction: column; align-items: center;">
-                        <span style="font-size: 11px; font-weight: 600; color: #64748b; margin-bottom: 4px;">Rendered Mesh GIF</span>
+                        <span style="font-size: 10px; font-weight: 600; color: #64748b; margin-bottom: 2px;">Mesh GIF</span>
                         {item.preview_url ? (
-                          <img src={item.preview_url} alt="Mesh Render" style="width: 160px; height: 200px; object-fit: contain; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
+                          <img src={item.preview_url} alt="Mesh Render" style="width: 120px; height: 150px; object-fit: contain; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
                         ) : (
-                          <div style="width: 160px; height: 200px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 12px; border: 1px solid #e2e8f0; text-align: center; padding: 10px;">Rendering in progress...</div>
+                          <div style="width: 120px; height: 150px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 11px; border: 1px solid #e2e8f0; text-align: center; padding: 4px;">Rendering...</div>
                         )}
                       </div>
                     </div>
 
-                    <label style="font-size: 14px; font-weight: 500; color: #334155; margin-bottom: 6px; width: 100%; display: flex; justify-content: space-between;">
-                      <span>Reward Score:</span>
+                    <label style="font-size: 12px; font-weight: 500; color: #334155; margin-bottom: 4px; width: 100%; display: flex; justify-content: space-between;">
+                      <span>Score:</span>
                       <strong style="color: #2563eb;">{scores()[item.id] ?? 0.5}</strong>
                     </label>
                     <input type="range" min="0" max="1" step="0.1" value={scores()[item.id] ?? 0.5} 
                       onInput={(e) => handleScoreChange(item.id, e.target.value)} 
-                      style="width: 100%; cursor: pointer; accent-color: #2563eb; margin-bottom: 8px;" />
+                      style="width: 100%; cursor: pointer; accent-color: #2563eb;" />
                   </div>
                 )}
               </For>
             </div>
             <button onClick={submitScores} style="padding: 14px 32px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; box-shadow: 0 4px 6px -1px rgba(37,99,235,0.3); transition: background 0.2s;">
-              Submit Batch Scores & Continue Training
+              Submit Batch 20 Scores & Continue Training
             </button>
           </div>
         )}

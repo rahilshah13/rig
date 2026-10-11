@@ -44,6 +44,40 @@ write_rigging_program_by_seconds(Seconds) :-
         close(Stream)
     ).
 
+%% ---------------------------------------------------------
+%% Extended Random & Parameterized API for Batch Variations
+%% ---------------------------------------------------------
+
+write_random_rigging_program(Index) :-
+    setrand(Index),
+    actions(Actions),
+    length(Actions, Len),
+    random(1, Len + 1, RndIndex),
+    nth1(RndIndex, Actions, ActionName),
+    random(0.5, 4.5, Freq),
+    random(0.1, 0.55, Amp),
+    bones(Bones),
+    format(atom(Filename), 'rig_~w.json', [Index]),
+    setup_call_cleanup(
+        open(Filename, write, Stream),
+        write_json_scene(Stream, Bones, ActionName, Freq, Amp),
+        close(Stream)
+    ),
+    setup_call_cleanup(
+        open('script.json', write, Stream2),
+        write_json_scene(Stream2, Bones, ActionName, Freq, Amp),
+        close(Stream2)
+    ).
+
+write_rigging_program_with_seconds(Index, Seconds) :-
+    bones(Bones),
+    format(atom(Filename), 'rig_~w.json', [Index]),
+    setup_call_cleanup(
+        open(Filename, write, Stream),
+        write_json_scene_seconds(Stream, Bones, Seconds),
+        close(Stream)
+    ).
+
 actions([bowing, walking, waving, running, ducking, jumping, punching, kicking, dodging]).
 
 get_action_params(bowing, 0.9, 0.3).

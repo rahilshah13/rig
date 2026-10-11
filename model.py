@@ -42,7 +42,7 @@ frontend_state = {
     "latest_scores": [],
     "waiting_for_human": True,
     "epoch": 1,
-    "status_message": "Initializing JAX diffusion environment..."
+    "status_message": "Initializing 20-item Trealla Prolog & JAX training pipeline..."
 }
 
 rms_norm = lambda x, scale, eps=1e-5: x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps) * scale
@@ -145,7 +145,7 @@ def get_current_batch():
 async def submit_human_scores(request: Request):
     data = await request.json()
     scores = data.get("scores", [])
-    print(f"\n[Human Feedback Received via SolidJS]: {scores}")
+    print(f"\n[Human Feedback Received via SolidJS for 20 items]: {scores}")
     frontend_state["latest_scores"] = scores
     frontend_state["waiting_for_human"] = False
     return {"status": "success", "received_scores": scores}
@@ -167,9 +167,12 @@ def serve_index():
         return FileResponse("frontend/dist/index.html")
     return JSONResponse({"status": "error", "message": "Frontend not built or index.html missing"}, status_code=504)
 
-def evaluate_batch_with_human_feedback(params, batch_size=3):
-    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Running JAX diffusion forward pass..."
-    print(f"\n[RL Env] Evaluating batch of {batch_size} generated bone-level rigging variations...")
+def evaluate_batch_with_human_feedback(params, batch_size=20):
+    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Running JAX diffusion forward pass for {batch_size} variations..."
+    print(f"\n[RL Env] Evaluating batch of {batch_size} generated rigging variations via Trealla Prolog...")
+    
+    key = jax.random.PRNGKey(frontend_state['epoch'] * 42)
+    dummy_input = jax.random.normal(key, (batch_size, 4, 44100))
     
     dummy_conditions = (
         jnp.zeros((batch_size,), dtype=jnp.int32),
@@ -178,12 +181,10 @@ def evaluate_batch_with_human_feedback(params, batch_size=3):
         jnp.zeros((batch_size, 4), dtype=jnp.int32),
         jnp.ones((batch_size, 4), dtype=jnp.float32)
     )
-    dummy_input = jnp.ones((batch_size, 4, 44100), dtype=jnp.float32)
     
     output = gpt_forward(params, dummy_input, dummy_conditions, modality_type="audio")
     
     batch_metadata = []
-    # Pre-populate placeholder items so the UI shows cards instantly while GIFs render incrementally
     for i in range(batch_size):
         p = output[i, 0, :]
         bone_transforms = {}
@@ -209,47 +210,47 @@ def evaluate_batch_with_human_feedback(params, batch_size=3):
 
     frontend_state["current_batch"] = batch_metadata
 
-    # Render each variation incrementally so status updates in real-time
     for i in range(batch_size):
         item = batch_metadata[i]
-        frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Rendering mesh GIF {i+1} of {batch_size}..."
+        var_id = item["id"]
+        rig_filename = f"rig_{var_id}_epoch_{frontend_state['epoch']}.json"
         
-        scene_ast = []
-        for bone in SKELETAL_BONES:
-            parent = bone_parents.get(bone)
-            bt = item["bone_transforms"][bone]
-            node = {
-                "bone": bone,
-                "parent": parent,
-                "transformations": [
-                    {"type": "translate", "values": [0.0, 0.0, 0.0]},
-                    {"type": "oscillate", "axis": bt["axis"], "freq": bt["freq"], "amp": bt["amp"]}
-                ]
-            }
-            scene_ast.append(node)
+        frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Generating {rig_filename} via Prolog for variation {var_id} of {batch_size}..."
+        
+        try:
+            subprocess.run(
+                ["tpl", "-l", "rig_gen.pl", "-g", f"write_random_rigging_program({var_id}), halt."],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if os.path.exists(f"rig_{var_id}.json"):
+                shutil.copy(f"rig_{var_id}.json", rig_filename)
+        except Exception as prolog_err:
+            print(f"Trealla Prolog execution error on variation {var_id}: {prolog_err}")
+            scene_ast = [{"bone": b, "parent": bone_parents.get(b), "transformations": [{"type": "translate", "values": [0.0, 0.0, 0.0]}, {"type": "oscillate", "axis": "x", "freq": 1.0 + (var_id * 0.1), "amp": 0.2}]} for b in SKELETAL_BONES]
+            with open(rig_filename, "w") as f:
+                json.dump(scene_ast, f, indent=2)
 
-        json_path = "script.json"
-        with open(json_path, "w") as f:
-            json.dump(scene_ast, f, indent=2)
-
-        gif_filename = f"rigged_scene_var_{i+1}_epoch_{frontend_state['epoch']}.gif"
+        frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Rendering mesh GIF {var_id} of {batch_size}..."
+        gif_filename = f"rigged_scene_var_{var_id}_epoch_{frontend_state['epoch']}.gif"
         try:
             scene_map = rig.generate_parametric_human(mass_kg=item["mass"], height_m=item["height"])
-            rig.parse_and_apply_json_ast(json_path, scene_map)
-            time_steps = np.linspace(0, 5.0, 150)
+            rig.parse_and_apply_json_ast(rig_filename, scene_map)
+            time_steps = np.linspace(0, 5.0, 100)
             rig.process_rigging_scene(scene_map, time_steps, output_filename=gif_filename)
             if os.path.exists(gif_filename):
                 item["preview_url"] = f"/gif/{gif_filename}"
         except Exception as e:
-            print(f"Simulation render error on variation {i+1}: {e}")
+            print(f"Simulation render error on variation {var_id}: {e}")
 
-        # Push incremental update to frontend state
         frontend_state["current_batch"] = list(batch_metadata)
 
     frontend_state["waiting_for_human"] = True
-    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Waiting for human RLHF scoring..."
+    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Waiting for human RLHF scoring on 20 variations..."
     
-    print(f"\n>>> Waiting for human RLHF scores for Epoch {frontend_state['epoch']}...")
+    print(f"\n>>> Waiting for human RLHF scores for Epoch {frontend_state['epoch']} (20 items)...")
     while frontend_state["waiting_for_human"]:
         time.sleep(0.5)
         
@@ -265,10 +266,10 @@ def run_training_loop(params):
         while True:
             frontend_state["epoch"] = global_step + 1
             print(f"\n================================")
-            print(f"--- Training Step / Epoch {global_step + 1} ---")
+            print(f"--- Training Step / Epoch {global_step + 1} (20-Batch) ---")
             print(f"================================")
             
-            batch_scores = evaluate_batch_with_human_feedback(params, batch_size=3)
+            batch_scores = evaluate_batch_with_human_feedback(params, batch_size=20)
             print(f"Recorded Human RLHF Scores from SolidJS: {batch_scores}")
             
             mean_reward = float(jnp.mean(batch_scores))
