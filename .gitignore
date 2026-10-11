@@ -3,3 +3,9 @@
 !README.md
 !rig_gen.pl
 !rig.py
+!model.py
+!frontend/package.json
+!frontend/vite.config.js
+!frontend/index.html
+!frontend/app.jsx
+!Dockerfile
