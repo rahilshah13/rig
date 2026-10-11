@@ -19,9 +19,3 @@
 ---
 
 <img width="800" height="800" alt="rigged_scene_4" src="https://github.com/user-attachments/assets/5c282f42-c368-475a-989d-e45bfa4673ba" />
-
----
-
-### `frontend` branch
-
-<img width="1710" height="984" alt="image" src="https://github.com/user-attachments/assets/f714abfb-d5c2-4fb4-9388-dc90e4bd650f" />
