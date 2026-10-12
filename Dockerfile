@@ -1,5 +1,5 @@
 # ==========================================
-# Stage 1: Build Stage (Frontend Bundler & Prolog/Python)
+# Stage 1: Build Stage (Frontend Bundler & Trealla Prolog & Python Dependencies)
 # ==========================================
 FROM python:3.10-slim AS builder
 
@@ -16,15 +16,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Clone and build Trealla Prolog so 'tpl' is available
 RUN git clone https://github.com/trealla-prolog/trealla.git /tmp/trealla \
     && cd /tmp/trealla \
     && make \
     && make install
 
+# Copy frontend source and build production bundle
 COPY frontend/ /build/frontend/
 WORKDIR /build/frontend
 RUN npm install && npm run build
 
+# Install Python packages in builder stage
 WORKDIR /build
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
@@ -38,15 +41,18 @@ RUN pip install --no-cache-dir --upgrade pip && \
     uvicorn \
     requests \
     PyOpenGL \
-    glfw
+    glfw \
+    imageio
 
 
 # ==========================================
+# Stage 2: Final Runtime Image
 # ==========================================
 FROM python:3.10-slim
 
 WORKDIR /app
 
+# Install necessary runtime libraries (FFmpeg for video/GIF encoding, GL/GLFW bindings)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libedit2 \
     libffi8 \
@@ -56,6 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglfw3 \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy binaries, Python site-packages, and built frontend from builder stage
 COPY --from=builder /usr/local/bin/tpl /usr/local/bin/tpl
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
@@ -64,5 +71,7 @@ COPY --from=builder /build/frontend/dist /app/frontend/dist
 COPY . /app
 
 EXPOSE 8000
+EXPOSE 8001
 
-CMD ["python", "model.py"]
+# Run render.py on port 8001 and model.py on port 8000 concurrently
+CMD ["sh", "-c", "python render.py 8001 & python model.py"]

@@ -10,10 +10,6 @@ from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 
-import rig
-import point_cloud_renderer
-import opengl_renderer
-
 jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", False)
 
@@ -54,7 +50,7 @@ frontend_state = {
 }
 
 # -----------------------------------------------------------------------------
-# 1. Transformer Architecture, Multimodal Mixing & Diffusion Core
+# 1. Transformer Architecture & Diffusion Core
 # -----------------------------------------------------------------------------
 rms_norm = lambda x, scale, eps=1e-5: x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps) * scale
 apply_rope = lambda x, freq=10000.0: (lambda c, s: x.at[..., 0::2].set(x[..., 0::2]*c - x[..., 1::2]*s).at[..., 1::2].set(x[..., 0::2]*s + x[..., 1::2]*c))(jnp.cos(jnp.arange(x.shape[-2], dtype=jnp.float32)[None, :, None] / (freq ** (jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1]))), jnp.sin(jnp.arange(x.shape[-2], dtype=jnp.float32)[None, :, None] / (freq ** (jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1]))))
@@ -74,14 +70,6 @@ def multimodal_mixing_layer(x, modality_type, params, target_dim=1024, comp_dim=
         return encoded, 1
     else:
         raise ValueError(f"Unsupported modality type: {modality_type}")
-
-def combined_audio_loss(pred, target, mask=None, n_fft=1024):
-    if mask is not None:
-        pred = pred * mask[:, :, None]
-        target = target * mask[:, :, None]
-    pf, nf = map(lambda x: jnp.pad(x.reshape(-1), (0, (-x.size) % n_fft)), (pred, target))
-    xf, yf = map(lambda arr: jnp.abs(jnp.fft.rfft(arr.reshape(-1, n_fft))), (pf, nf))
-    return jnp.mean(jnp.abs(xf - yf)) + jnp.mean(jnp.square(jnp.log(xf + 1e-5) - jnp.log(yf + 1e-5))) + 0.5 * jnp.mean(jnp.abs(pred - target))
 
 def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num_patches=100, n_heads=16, modality_type="audio"):
     scale, bpm, stem, step_indices, sigma_t = cond
@@ -298,7 +286,7 @@ def compile_closed_jaxpr_to_arm64(closed_jaxpr):
     return "\n".join(asm), {"peak_registers": max(live_trace) if live_trace else 0, "total_regs": total_vector_regs}
 
 # -----------------------------------------------------------------------------
-# 4. API Endpoints & Training Loop with Parallel ThreadPool Rendering
+# 4. API Endpoints & Training Loop
 # -----------------------------------------------------------------------------
 load_checkpoint_safely = lambda: (lambda clf: (fcntl.flock(clf, fcntl.LOCK_EX), res := (pickle.load(open(CURR_CKPT, "rb")) if os.path.exists(CURR_CKPT) else None), fcntl.flock(clf, fcntl.LOCK_UN), res)[-1])(open(CKPT_LOCK_PATH, "a+"))
 
@@ -408,34 +396,6 @@ def serve_index():
         return FileResponse("frontend/dist/index.html")
     return JSONResponse({"status": "error", "message": "Frontend not built or index.html missing"}, status_code=504)
 
-def render_single_variation(item, epoch):
-    var_id = item["id"]
-    rig_filename = f"rig_{var_id}_epoch_{epoch}.json"
-    gif_filename = f"rigged_scene_var_{var_id}_epoch_{epoch}.gif"
-    
-    try:
-        subprocess.run(
-            ["tpl", "-l", "rig_gen.pl", "-g", f"write_random_rigging_program({var_id}), halt."],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        if os.path.exists(f"rig_{var_id}.json"):
-            shutil.copy(f"rig_{var_id}.json", rig_filename)
-    except Exception:
-        scene_ast = [{"bone": b, "parent": bone_parents.get(b), "transformations": [{"type": "translate", "values": [0.0, 0.0, 0.0]}, {"type": "oscillate", "axis": "x", "freq": 1.0 + (var_id * 0.1), "amp": 0.2}]} for b in SKELETAL_BONES]
-        with open(rig_filename, "w") as f:
-            json.dump(scene_ast, f, indent=2)
-
-    try:
-        scene_map = rig.generate_parametric_human(mass_kg=item["mass"], height_m=item["height"])
-        rig.parse_and_apply_json_ast(rig_filename, scene_map)
-        time_steps = np.linspace(0, 5.0, 100)
-        rig.process_rigging_scene(scene_map, time_steps, output_filename=gif_filename)
-        if os.path.exists(gif_filename):
-            item["preview_url"] = f"/gif/{gif_filename}"
-    except Exception as e:
-        print(f"Simulation render error on variation {var_id}: {e}")
-    return item
-
 def evaluate_batch_with_human_feedback(params, vae_params, batch_size=16):
     frontend_state["current_operation"] = "JAX Diffusion Forward Pass"
     frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Running JAX diffusion forward pass for {batch_size} variations..."
@@ -473,19 +433,10 @@ def evaluate_batch_with_human_feedback(params, vae_params, batch_size=16):
             "mass": round(mass, 1),
             "height": round(height, 2),
             "bone_transforms": bone_transforms,
-            "preview_url": None
+            "preview_url": f"/gif/rigged_scene_var_{i+1}_epoch_{frontend_state['epoch']}.gif"
         })
 
     frontend_state["current_batch"] = batch_metadata
-
-    frontend_state["current_operation"] = f"Parallel Trealla Prolog & GIF Rendering ({batch_size} Variations)"
-    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Rendering all {batch_size} variations concurrently..."
-
-    epoch = frontend_state["epoch"]
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        rendered_batch = list(executor.map(lambda item: render_single_variation(item, epoch), batch_metadata))
-
-    frontend_state["current_batch"] = rendered_batch
     frontend_state["current_operation"] = "Waiting for Human RLHF Scoring"
     frontend_state["waiting_for_human"] = True
     frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Waiting for human RLHF scoring on {batch_size} variations..."
@@ -507,7 +458,7 @@ def run_training_loop(params, vae_params):
     try:
         while True:
             frontend_state["epoch"] = global_step + 1
-            frontend_state["current_operation"] = "Batch Evaluation & Parallel Pipeline"
+            frontend_state["current_operation"] = "Batch Evaluation & JAX Forward Pass"
             
             batch_scores = evaluate_batch_with_human_feedback(params, vae_params, batch_size=16)
             
@@ -536,128 +487,6 @@ def run_training_loop(params, vae_params):
             global_step += 1
     except Exception as e:
         print(f"Training loop error: {e}")
-
-# -----------------------------------------------------------------------------
-# 5. Render Endpoints
-# -----------------------------------------------------------------------------
-PRESETS = {
-    "front": {"elevation": 0, "azim": 0, "color": (255, 255, 255)},
-    "side": {"elevation": 0, "azim": 90, "color": (200, 200, 200)},
-    "isometric": {"elevation": 35.264, "azim": 45, "color": (150, 150, 150)},
-    "cinematic": {"elevation": 15, "azim": -60, "color": (220, 220, 220)}
-}
-
-def project_3d_to_2d(vertices, azim_deg, elev_deg, width, height, scale=120):
-    azim, elev = math.radians(azim_deg), math.radians(elev_deg)
-    cos_a, sin_a = math.cos(azim), math.sin(azim)
-    cos_e, sin_e = math.cos(elev), math.sin(elev)
-    projected = []
-    for v in vertices:
-        x, y, z = v[0], v[1], v[2]
-        x1 = x * cos_a + z * sin_a
-        z1 = -x * sin_a + z * cos_a
-        y2 = y * cos_e - z1 * sin_e
-        z2 = y * sin_e + z1 * cos_e
-        screen_x = width // 2 + int(x1 * scale)
-        screen_y = height // 2 - int(y2 * scale)
-        projected.append((screen_x, screen_y, z2))
-    return projected
-
-def generate_card_2d_video(json_path, mass, height, output_mp4, preset_name="isometric"):
-    preset = PRESETS.get(preset_name, PRESETS["isometric"])
-    azim, elev, color = preset["azim"], preset["elevation"], preset["color"]
-    W, H, FPS = 240, 300, 30
-    total_frames = 60
-
-    scene_map = rig.generate_parametric_human(mass_kg=mass, height_m=height)
-    rig.parse_and_apply_json_ast(json_path, scene_map)
-    time_steps = np.linspace(0, 2.0, total_frames)
-
-    os.makedirs("renders", exist_ok=True)
-    raw_path = os.path.join("renders", f"temp_{os.path.basename(output_mp4)}.rgb")
-
-    with open(raw_path, "wb") as f_out:
-        for t in time_steps:
-            frame = [255, 255, 255] * (W * H)
-            for obj in scene_map.values():
-                mesh = obj.get_mesh_at_time(t)
-                if hasattr(mesh, 'vertices') and hasattr(mesh, 'faces'):
-                    verts, faces = mesh.vertices, mesh.faces
-                    proj = project_3d_to_2d(verts, azim, elev, W, H, scale=100)
-                    for face in faces:
-                        p0, p1, p2 = proj[face[0]], proj[face[1]], proj[face[2]]
-                        for pa, pb in [(p0, p1), (p1, p2), (p2, p0)]:
-                            steps = int(max(abs(pb[0] - pa[0]), abs(pb[1] - pa[1]))) + 1
-                            for i in range(steps):
-                                st = i / max(steps, 1)
-                                x = int(pa[0] + (pb[0] - pa[0]) * st)
-                                y = int(pa[1] + (pb[1] - pa[1]) * st)
-                                if 0 <= x < W and 0 <= y < H:
-                                    idx = (y * W + x) * 3
-                                    frame[idx], frame[idx+1], frame[idx+2] = color[0], color[1], color[2]
-            f_out.write(bytearray(frame))
-
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{W}x{H}", "-r", str(FPS), "-i", raw_path,
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", output_mp4
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if os.path.exists(raw_path):
-        os.remove(raw_path)
-
-@app.post("/api/render-card")
-async def api_render_card(request: Request):
-    data = await request.json()
-    var_id = data.get("var_id")
-    epoch = data.get("epoch", frontend_state["epoch"])
-    preset = data.get("preset", "isometric")
-    
-    rig_filename = f"rig_{var_id}_epoch_{epoch}.json"
-    if not os.path.exists(rig_filename):
-        rig_filename = f"rig_{var_id}.json"
-        
-    item = next((x for x in frontend_state["current_batch"] if x["id"] == var_id), {"mass": 75.0, "height": 1.75})
-    output_filename = f"var_{var_id}_epoch_{epoch}_{preset}.mp4"
-    output_path = os.path.join("renders", output_filename)
-    
-    try:
-        generate_card_2d_video(rig_filename, item["mass"], item["height"], output_path, preset_name=preset)
-        return {"status": "success", "video_url": f"/renders/{output_filename}"}
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-@app.post("/api/render-pointcloud")
-async def api_render_pointcloud(request: Request):
-    data = await request.json()
-    var_id = data.get("var_id")
-    epoch = data.get("epoch", frontend_state["epoch"])
-    
-    item = next((x for x in frontend_state["current_batch"] if x["id"] == var_id), {"mass": 75.0, "height": 1.75})
-    output_filename = f"var_{var_id}_epoch_{epoch}_pc.mp4"
-    output_path = os.path.join("renders", output_filename)
-    
-    try:
-        point_cloud_renderer.render_point_cloud_animation("rigged_glbs", output_path, mass=item["mass"], height=item["height"])
-        return {"status": "success", "video_url": f"/renders/{output_filename}"}
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-@app.post("/api/render-opengl")
-async def api_render_opengl(request: Request):
-    data = await request.json()
-    var_id = data.get("var_id")
-    epoch = data.get("epoch", frontend_state["epoch"])
-    
-    item = next((x for x in frontend_state["current_batch"] if x["id"] == var_id), {"mass": 75.0, "height": 1.75})
-    output_filename = f"var_{var_id}_epoch_{epoch}_gl.mp4"
-    output_path = os.path.join("renders", output_filename)
-    
-    try:
-        opengl_renderer.render_opengl_mesh_animation("rigged_glbs", output_path, mass=item["mass"], height=item["height"])
-        return {"status": "success", "video_url": f"/renders/{output_filename}"}
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 os.makedirs("renders", exist_ok=True)
 app.mount("/renders", StaticFiles(directory="renders"), name="renders")
@@ -694,5 +523,5 @@ if __name__ == "__main__":
     training_thread = threading.Thread(target=run_training_loop, args=(params, vae_params), daemon=True)
     training_thread.start()
 
-    print("[Daemon] Starting FastAPI server on port 8000 with black-and-white theme & parallel rendering...")
+    print("[Daemon] Starting Decoupled FastAPI server on port 8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
