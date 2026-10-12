@@ -9,3 +9,6 @@
 !frontend/index.html
 !frontend/app.jsx
 !Dockerfile
+!opengl_renderer.py
+!point_cloud_renderer.py
+!render.py
