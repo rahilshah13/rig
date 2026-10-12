@@ -1,4 +1,4 @@
-import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, glob, optax, jax, argparse
+import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, glob, math, optax, jax, argparse
 import numpy as np, jax.numpy as jnp
 from flax import linen as nn
 from jax.flatten_util import ravel_pytree
@@ -9,6 +9,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 
 import rig
+import point_cloud_renderer
+import opengl_renderer
 
 jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", False)
@@ -279,6 +281,135 @@ def run_training_loop(params):
             global_step += 1
     except Exception as e:
         print(f"Training loop error: {e}")
+
+
+# ---------------------------------------------------------
+# 2D Render & Camera Preset Engine (Integrated)
+# ---------------------------------------------------------
+PRESETS = {
+    "front": {"elevation": 0, "azim": 0, "color": (37, 99, 235)},
+    "side": {"elevation": 0, "azim": 90, "color": (70, 130, 180)},
+    "isometric": {"elevation": 35.264, "azim": 45, "color": (55, 65, 81)},
+    "cinematic": {"elevation": 15, "azim": -60, "color": (235, 180, 40)}
+}
+
+def project_3d_to_2d(vertices, azim_deg, elev_deg, width, height, scale=120):
+    azim, elev = math.radians(azim_deg), math.radians(elev_deg)
+    cos_a, sin_a = math.cos(azim), math.sin(azim)
+    cos_e, sin_e = math.cos(elev), math.sin(elev)
+    projected = []
+    for v in vertices:
+        x, y, z = v[0], v[1], v[2]
+        x1 = x * cos_a + z * sin_a
+        z1 = -x * sin_a + z * cos_a
+        y2 = y * cos_e - z1 * sin_e
+        z2 = y * sin_e + z1 * cos_e
+        screen_x = width // 2 + int(x1 * scale)
+        screen_y = height // 2 - int(y2 * scale)
+        projected.append((screen_x, screen_y, z2))
+    return projected
+
+def generate_card_2d_video(json_path, mass, height, output_mp4, preset_name="isometric"):
+    preset = PRESETS.get(preset_name, PRESETS["isometric"])
+    azim, elev, color = preset["azim"], preset["elevation"], preset["color"]
+    W, H, FPS = 240, 300, 30
+    total_frames = 60 # 2 seconds loop
+
+    scene_map = rig.generate_parametric_human(mass_kg=mass, height_m=height)
+    rig.parse_and_apply_json_ast(json_path, scene_map)
+    time_steps = np.linspace(0, 2.0, total_frames)
+
+    os.makedirs("renders", exist_ok=True)
+    raw_path = os.path.join("renders", f"temp_{os.path.basename(output_mp4)}.rgb")
+
+    with open(raw_path, "wb") as f_out:
+        for t in time_steps:
+            frame = [248, 250, 252] * (W * H) # light background #f8fafc
+            for obj in scene_map.values():
+                mesh = obj.get_mesh_at_time(t)
+                if hasattr(mesh, 'vertices') and hasattr(mesh, 'faces'):
+                    verts, faces = mesh.vertices, mesh.faces
+                    proj = project_3d_to_2d(verts, azim, elev, W, H, scale=100)
+                    for face in faces:
+                        p0, p1, p2 = proj[face[0]], proj[face[1]], proj[face[2]]
+                        for pa, pb in [(p0, p1), (p1, p2), (p2, p0)]:
+                            steps = int(max(abs(pb[0] - pa[0]), abs(pb[1] - pa[1]))) + 1
+                            for i in range(steps):
+                                st = i / max(steps, 1)
+                                x = int(pa[0] + (pb[0] - pa[0]) * st)
+                                y = int(pa[1] + (pb[1] - pa[1]) * st)
+                                if 0 <= x < W and 0 <= y < H:
+                                    idx = (y * W + x) * 3
+                                    frame[idx], frame[idx+1], frame[idx+2] = color[0], color[1], color[2]
+            f_out.write(bytearray(frame))
+
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{W}x{H}", "-r", str(FPS), "-i", raw_path,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", output_mp4
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.path.exists(raw_path):
+        os.remove(raw_path)
+
+@app.post("/api/render-card")
+async def api_render_card(request: Request):
+    data = await request.json()
+    var_id = data.get("var_id")
+    epoch = data.get("epoch", frontend_state["epoch"])
+    preset = data.get("preset", "isometric")
+    
+    rig_filename = f"rig_{var_id}_epoch_{epoch}.json"
+    if not os.path.exists(rig_filename):
+        rig_filename = f"rig_{var_id}.json"
+        
+    item = next((x for x in frontend_state["current_batch"] if x["id"] == var_id), {"mass": 75.0, "height": 1.75})
+    output_filename = f"var_{var_id}_epoch_{epoch}_{preset}.mp4"
+    output_path = os.path.join("renders", output_filename)
+    
+    try:
+        generate_card_2d_video(rig_filename, item["mass"], item["height"], output_path, preset_name=preset)
+        return {"status": "success", "video_url": f"/renders/{output_filename}"}
+    except Exception as e:
+        print(f"2D card render error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.post("/api/render-pointcloud")
+async def api_render_pointcloud(request: Request):
+    data = await request.json()
+    var_id = data.get("var_id")
+    epoch = data.get("epoch", frontend_state["epoch"])
+    
+    item = next((x for x in frontend_state["current_batch"] if x["id"] == var_id), {"mass": 75.0, "height": 1.75})
+    output_filename = f"var_{var_id}_epoch_{epoch}_pc.mp4"
+    output_path = os.path.join("renders", output_filename)
+    
+    try:
+        point_cloud_renderer.render_point_cloud_animation("rigged_glbs", output_path, mass=item["mass"], height=item["height"])
+        return {"status": "success", "video_url": f"/renders/{output_filename}"}
+    except Exception as e:
+        print(f"Point Cloud render error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.post("/api/render-opengl")
+async def api_render_opengl(request: Request):
+    data = await request.json()
+    var_id = data.get("var_id")
+    epoch = data.get("epoch", frontend_state["epoch"])
+    
+    item = next((x for x in frontend_state["current_batch"] if x["id"] == var_id), {"mass": 75.0, "height": 1.75})
+    output_filename = f"var_{var_id}_epoch_{epoch}_gl.mp4"
+    output_path = os.path.join("renders", output_filename)
+    
+    try:
+        opengl_renderer.render_opengl_mesh_animation("rigged_glbs", output_path, mass=item["mass"], height=item["height"])
+        return {"status": "success", "video_url": f"/renders/{output_filename}"}
+    except Exception as e:
+        print(f"OpenGL render error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+os.makedirs("renders", exist_ok=True)
+app.mount("/renders", StaticFiles(directory="renders"), name="renders")
 
 if __name__ == "__main__":
     os.makedirs("data", exist_ok=True)

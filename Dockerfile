@@ -36,11 +36,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     matplotlib \
     fastapi \
     uvicorn \
-    requests
+    requests \
+    PyOpenGL \
+    glfw
 
 
 # ==========================================
-# Stage 2: Final Runtime Stage
 # ==========================================
 FROM python:3.10-slim
 
@@ -51,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi8 \
     libssl3 \
     ffmpeg \
+    libgl1 \
+    libglfw3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/tpl /usr/local/bin/tpl

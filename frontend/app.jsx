@@ -39,10 +39,8 @@ function RigCanvas(props) {
       Object.keys(baseOffsets).forEach(bone => {
         const base = baseOffsets[bone];
         const cfg = transforms[bone] || { freq: 1.0, amp: 0.2, axis: 'x' };
-        
         let dx = 0, dy = 0, dz = 0;
         const oscillation = Math.sin(2 * Math.PI * cfg.freq * t) * cfg.amp * 20;
-        
         if (cfg.axis === 'x') dx = oscillation;
         else if (cfg.axis === 'y') dy = oscillation;
         else dz = oscillation;
@@ -86,6 +84,112 @@ function RigCanvas(props) {
 
   return (
     <canvas ref={canvasRef} width="120" height="150" style="background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
+  );
+}
+
+function VariationCard(props) {
+  const item = props.item;
+  const epoch = props.epoch;
+  const [viewMode, setViewMode] = createSignal("gif"); // "gif", "2d", "pc", "opengl"
+  const [preset, setPreset] = createSignal("isometric");
+  const [urls, setUrls] = createSignal({ "2d": "", "pc": "", "opengl": "" });
+  const [isRendering, setIsRendering] = createSignal(false);
+
+  const switchView = async (mode, selectedPreset = "isometric") => {
+    setViewMode(mode);
+    if (mode === "gif") return;
+    
+    setPreset(selectedPreset);
+    if (!urls()[mode]) {
+      setIsRendering(true);
+      let endpoint = "/api/render-card";
+      let payload = { var_id: item.id, epoch: epoch, preset: selectedPreset };
+      
+      if (mode === "pc") {
+        endpoint = "/api/render-pointcloud";
+        payload = { var_id: item.id, epoch: epoch };
+      } else if (mode === "opengl") {
+        endpoint = "/api/render-opengl";
+        payload = { var_id: item.id, epoch: epoch };
+      }
+
+      try {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.status === "success") {
+          setUrls({ ...urls(), [mode]: data.video_url });
+        }
+      } catch (err) {
+        console.error("Render error:", err);
+      } finally {
+        setIsRendering(false);
+      }
+    }
+  };
+
+  return (
+    <div style="background: #ffffff; padding: 14px; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); display: flex; flex-direction: column; align-items: center; text-align: left; border: 1px solid #e2e8f0;">
+      <div style="display: flex; justify-content: space-between; width: 100%; align-items: center; margin-bottom: 2px;">
+        <h3 style="font-size: 15px; font-weight: 600; color: #1e293b;">Var #{item.id}</h3>
+        <div style="display: flex; gap: 3px;">
+          <button onClick={() => switchView("gif")} style={`font-size: 9px; padding: 2px 5px; border-radius: 3px; border: 1px solid #cbd5e1; background: ${viewMode() === 'gif' ? '#2563eb' : '#f1f5f9'}; color: ${viewMode() === 'gif' ? '#fff' : '#475569'}; cursor: pointer;`}>GIF</button>
+          <button onClick={() => switchView("2d", preset())} style={`font-size: 9px; padding: 2px 5px; border-radius: 3px; border: 1px solid #cbd5e1; background: ${viewMode() === '2d' ? '#059669' : '#f1f5f9'}; color: ${viewMode() === '2d' ? '#fff' : '#475569'}; cursor: pointer;`}>2D</button>
+          <button onClick={() => switchView("pc")} style={`font-size: 9px; padding: 2px 5px; border-radius: 3px; border: 1px solid #cbd5e1; background: ${viewMode() === 'pc' ? '#d97706' : '#f1f5f9'}; color: ${viewMode() === 'pc' ? '#fff' : '#475569'}; cursor: pointer;`}>PC</button>
+          <button onClick={() => switchView("opengl")} style={`font-size: 9px; padding: 2px 5px; border-radius: 3px; border: 1px solid #cbd5e1; background: ${viewMode() === 'opengl' ? '#7c3aed' : '#f1f5f9'}; color: ${viewMode() === 'opengl' ? '#fff' : '#475569'}; cursor: pointer;`}>GL</button>
+        </div>
+      </div>
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 8px; width: 100%;">Mass: {item.mass}kg | H: {item.height}m</p>
+      
+      {viewMode() === "2d" && (
+        <div style="display: flex; gap: 4px; margin-bottom: 8px; width: 100%; justify-content: center;">
+          <select value={preset()} onChange={(e) => switchView("2d", e.target.value)} style="font-size: 10px; padding: 2px 4px; border-radius: 4px; border: 1px solid #cbd5e1;">
+            <option value="isometric">Isometric</option>
+            <option value="cinematic">Cinematic</option>
+            <option value="front">Front</option>
+            <option value="side">Side</option>
+          </select>
+        </div>
+      )}
+
+      <div style="display: flex; gap: 8px; width: 100%; justify-content: center; align-items: center; margin-bottom: 12px;">
+        <div style="display: flex; flex-direction: column; align-items: center;">
+          <span style="font-size: 10px; font-weight: 600; color: #64748b; margin-bottom: 2px;">Bone Rig</span>
+          <RigCanvas transforms={item.bone_transforms} />
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: center;">
+          <span style="font-size: 10px; font-weight: 600; color: #64748b; margin-bottom: 2px;">{viewMode().toUpperCase()} View</span>
+          {viewMode() === 'gif' ? (
+            item.preview_url ? (
+              <img src={item.preview_url} alt="Mesh Render" style="width: 120px; height: 150px; object-fit: contain; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
+            ) : (
+              <div style="width: 120px; height: 150px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 11px; border: 1px solid #e2e8f0; text-align: center; padding: 4px;">Rendering...</div>
+            )
+          ) : (
+            isRendering() ? (
+              <div style="width: 120px; height: 150px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #059669; font-size: 11px; border: 1px solid #e2e8f0; text-align: center; padding: 4px;">Rendering...</div>
+            ) : (
+              urls()[viewMode()] ? (
+                <video controls autoplay loop src={urls()[viewMode()]} style="width: 120px; height: 150px; object-fit: contain; background: #000; border-radius: 6px; border: 1px solid #e2e8f0;" />
+              ) : (
+                <div style="width: 120px; height: 150px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 11px; border: 1px solid #e2e8f0; text-align: center; padding: 4px;">Ready</div>
+              )
+            )
+          )}
+        </div>
+      </div>
+
+      <label style="font-size: 12px; font-weight: 500; color: #334155; margin-bottom: 4px; width: 100%; display: flex; justify-content: space-between;">
+        <span>Score:</span>
+        <strong style="color: #2563eb;">{props.score ?? 0.5}</strong>
+      </label>
+      <input type="range" min="0" max="1" step="0.1" value={props.score ?? 0.5} 
+        onInput={(e) => props.onScoreChange(item.id, e.target.value)} 
+        style="width: 100%; cursor: pointer; accent-color: #2563eb;" />
+    </div>
   );
 }
 
@@ -142,18 +246,17 @@ function App() {
   return (
     <div style="font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 40px 20px; box-sizing: border-box;">
       <div style="width: 100%; max-width: 1400px; display: flex; flex-direction: column; align-items: center; text-align: center;">
-        <h1 style="font-size: 28px; font-weight: 700; color: #0f172a; margin-bottom: 8px;">Rig Environment - 20-Variation Human-in-the-Loop Scoring Dashboard</h1>
+        <h1 style="font-size: 28px; font-weight: 700; color: #0f172a; margin-bottom: 8px;">Rig Environment - Human-in-the-Loop Scoring Dashboard</h1>
         <p style="font-size: 16px; color: #64748b; margin-bottom: 8px;">Training Epoch: <strong style="color: #2563eb;">{batchData().epoch}</strong></p>
         
-        {/* Live Status Progress Banner */}
-        <div style="background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; margin-bottom: 24px; display: flex; align-items: center; gap: 8px;">
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; margin-bottom: 24px; display: flex; align-items: center; gap: 8px; width: 100%; max-width: 800px; justify-content: center;">
           <div style="width: 8px; height: 8px; background: #2563eb; border-radius: 50%; animation: pulse 1.5s infinite;"></div>
           <span>Status: {batchData().status}</span>
         </div>
         <style>{`@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }`}</style>
         
         {batchData().batch.length === 0 ? (
-          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); width: 100%; margin-top: 20px;">
+          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); width: 100%;">
             <div style="width: 44px; height: 44px; border: 4px solid #e2e8f0; border-top-color: #2563eb; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
             <p style="font-size: 16px; color: #475569; font-weight: 500;">Generating 20 procedural variations via Trealla Prolog & JAX...</p>
             <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
@@ -163,33 +266,7 @@ function App() {
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; width: 100%; margin-bottom: 32px;">
               <For each={batchData().batch}>
                 {(item) => (
-                  <div style="background: #ffffff; padding: 14px; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); display: flex; flex-direction: column; align-items: center; text-align: left; border: 1px solid #e2e8f0;">
-                    <h3 style="font-size: 16px; font-weight: 600; color: #1e293b; margin-bottom: 2px; width: 100%;">Var #{item.id}</h3>
-                    <p style="font-size: 12px; color: #64748b; margin-bottom: 10px; width: 100%;">Mass: {item.mass}kg | H: {item.height}m</p>
-                    
-                    <div style="display: flex; gap: 8px; width: 100%; justify-content: center; align-items: center; margin-bottom: 12px;">
-                      <div style="display: flex; flex-direction: column; align-items: center;">
-                        <span style="font-size: 10px; font-weight: 600; color: #64748b; margin-bottom: 2px;">Bone Rig</span>
-                        <RigCanvas transforms={item.bone_transforms} />
-                      </div>
-                      <div style="display: flex; flex-direction: column; align-items: center;">
-                        <span style="font-size: 10px; font-weight: 600; color: #64748b; margin-bottom: 2px;">Mesh GIF</span>
-                        {item.preview_url ? (
-                          <img src={item.preview_url} alt="Mesh Render" style="width: 120px; height: 150px; object-fit: contain; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;" />
-                        ) : (
-                          <div style="width: 120px; height: 150px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 11px; border: 1px solid #e2e8f0; text-align: center; padding: 4px;">Rendering...</div>
-                        )}
-                      </div>
-                    </div>
-
-                    <label style="font-size: 12px; font-weight: 500; color: #334155; margin-bottom: 4px; width: 100%; display: flex; justify-content: space-between;">
-                      <span>Score:</span>
-                      <strong style="color: #2563eb;">{scores()[item.id] ?? 0.5}</strong>
-                    </label>
-                    <input type="range" min="0" max="1" step="0.1" value={scores()[item.id] ?? 0.5} 
-                      onInput={(e) => handleScoreChange(item.id, e.target.value)} 
-                      style="width: 100%; cursor: pointer; accent-color: #2563eb;" />
-                  </div>
+                  <VariationCard item={item} epoch={batchData().epoch} score={scores()[item.id]} onScoreChange={handleScoreChange} />
                 )}
               </For>
             </div>
