@@ -1,4 +1,4 @@
-import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, glob, math, optax, jax, argparse
+import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, glob, math, optax, jax, argparse, requests
 import numpy as np, jax.numpy as jnp
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
@@ -9,16 +9,17 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
+from collections import deque
 
 jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", False)
 
 CONCURRENT_MODELS = 3
 CURR_CKPT, PREV_CKPT = "checkpoints/checkpoint_bundle.pickle", "checkpoints/checkpoint_bundle_prev.pickle"
-CKPT_LOCK_PATH, GRAD_LOCK_PATH = "checkpoints/checkpoint.lock", "data/shared_gradients.lock"
-META_LOCK_PATH = "checkpoints/meta.lock"
-NTK_LOCK_PATH = "checkpoints/ntk.lock"
+CKPT_LOCK_PATH = "checkpoints/checkpoint.lock"
 INIT_SEED_PATH = "checkpoints/init_seed.lock"
+
+RENDER_SERVICE_URL = "http://localhost:8001"
 
 SKELETAL_BONES = [
     'Hips', 'Spine', 'Chest', 'Neck', 'Head',
@@ -28,107 +29,82 @@ SKELETAL_BONES = [
     'RightUpperLeg', 'RightLowerLeg', 'RightFoot'
 ]
 
-bone_parents = {
-    'Spine': 'Hips', 'Chest': 'Spine', 'Neck': 'Chest', 'Head': 'Neck',
-    'LeftShoulder': 'Chest', 'LeftUpperArm': 'LeftShoulder', 'LeftLowerArm': 'LeftUpperArm', 'LeftHand': 'LeftLowerArm',
-    'RightShoulder': 'Chest', 'RightUpperArm': 'RightShoulder', 'RightLowerArm': 'RightUpperArm', 'RightHand': 'RightLowerArm',
-    'LeftUpperLeg': 'Hips', 'LeftLowerLeg': 'LeftUpperLeg', 'LeftFoot': 'LeftLowerLeg',
-    'RightUpperLeg': 'Hips', 'RightLowerLeg': 'RightUpperLeg', 'RightFoot': 'RightLowerLeg'
-}
+FEATURE_DIM = len(SKELETAL_BONES) * 3 + 2
 
 app = FastAPI()
 
 frontend_state = {
     "current_batch": [],
-    "latest_scores": [],
-    "waiting_for_human": True,
+    "currentIndex": 0,
+    "latest_scores": {},
     "epoch": 1,
-    "status_message": "Initializing 16-item Trealla Prolog & JAX training pipeline...",
-    "real_loss": 0.0,
+    "status_message": "Running skeletal diffusion pipeline with disambiguated loss metrics...",
+    "actual_loss": 0.0,
     "normalized_loss": 0.0,
-    "current_operation": "Idle"
+    "actual_loss_range": "[0, inf)",
+    "normalized_loss_range": "[0, 1]",
+    "current_operation": "Active Functional Scan Training",
+    "is_paused": False,
+    "active_checkpoint": "checkpoint_bundle.pickle"
 }
 
+state_lock = threading.Lock()
+
+def log_to_stream(msg: str):
+    print(msg, flush=True)
+
 # -----------------------------------------------------------------------------
-# 1. Transformer Architecture & Diffusion Core
+# 1. Functional Looped Transformer with jax.lax.scan & Diffusion Denoising
 # -----------------------------------------------------------------------------
 rms_norm = lambda x, scale, eps=1e-5: x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps) * scale
 apply_rope = lambda x, freq=10000.0: (lambda c, s: x.at[..., 0::2].set(x[..., 0::2]*c - x[..., 1::2]*s).at[..., 1::2].set(x[..., 0::2]*s + x[..., 1::2]*c))(jnp.cos(jnp.arange(x.shape[-2], dtype=jnp.float32)[None, :, None] / (freq ** (jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1]))), jnp.sin(jnp.arange(x.shape[-2], dtype=jnp.float32)[None, :, None] / (freq ** (jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1]))))
 scaled_dot_product_attention = lambda q, k, v, mask=None: jnp.matmul(jax.nn.softmax(jnp.matmul(q, jnp.swapaxes(k, -2, -1)) * (1.0 / jnp.sqrt(q.shape[-1])) + (mask if mask is not None else 0.0), axis=-1), v)
 
-def multimodal_mixing_layer(x, modality_type, params, target_dim=1024, comp_dim=512):
-    if modality_type == "audio":
-        patch_dim = 441
-        B, T, L = x.shape
-        num_patches = L // patch_dim
-        encoded = jax.nn.gelu(x.reshape(B, T, num_patches, patch_dim) @ params['audio_encoder']) @ params['down_proj_2']
-        return encoded, num_patches
-    elif modality_type == "token":
-        B, T, D = x.shape
-        token_enc = params.get('token_encoder', params['audio_encoder'][:D, :comp_dim])
-        encoded = jax.nn.gelu(x @ token_enc) @ params['down_proj_2']
-        return encoded, 1
-    else:
-        raise ValueError(f"Unsupported modality type: {modality_type}")
-
-def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num_patches=100, n_heads=16, modality_type="audio"):
-    scale, bpm, stem, step_indices, sigma_t = cond
-    B, T = x.shape[0], x.shape[1]
+def skeleton_diffusion_transformer(params, x, cond, n_heads=8, num_loops=4):
+    sigma_t, human_reward_scores = cond
+    B, T, D = x.shape
     
-    x = rms_norm(x, params['input_rms_scale'])
-    encoded, num_p = multimodal_mixing_layer(x, modality_type, params)
-    C, bt = encoded.shape[-1], B * T
+    h = jax.nn.gelu(x @ params['input_proj'])
+    C = h.shape[-1]
     head_dim = C // n_heads
     
-    p_mask = None
-    if mask is not None:
-        patch_mask_2d = jnp.ones((B, T, num_p, num_p), dtype=bool) & mask[:, :, None, None]
-        p_mask = jnp.where(patch_mask_2d.reshape(bt, num_p, num_p)[:, None, :, :], 0.0, -1e9)
+    def transformer_scan_body(h_curr, _):
+        q, k, v = map(lambda key: (h_curr @ params[key]).reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3), ['query', 'key', 'value'])
+        attn_out = scaled_dot_product_attention(apply_rope(q), apply_rope(k), v).transpose(0, 2, 1, 3).reshape(B, T, C)
+        
+        h_next = rms_norm(attn_out + h_curr, params['rms_scale_1'])
+        h_next = rms_norm(h_next + jax.nn.gelu(h_next @ params['ff_1']) @ params['ff_2'], params['rms_scale_2'])
+        return h_next, None
 
-    patch_seq = encoded.reshape(bt, num_p, C)
-    q_p, k_p, v_p = map(lambda k: (patch_seq @ params[k]).reshape(bt, num_p, n_heads, head_dim).transpose(0, 2, 1, 3), ['query', 'key', 'value'])
+    h, _ = jax.lax.scan(transformer_scan_body, h, xs=None, length=num_loops)
     
-    attn_out_p = scaled_dot_product_attention(apply_rope(q_p), apply_rope(k_p), v_p, p_mask).transpose(0, 2, 1, 3).reshape(bt, num_p, C)
-    h_p = rms_norm(attn_out_p + patch_seq, params['rms_scale_1'])
-    h_p = rms_norm(h_p + jax.nn.gelu(h_p @ params['ff_1']) @ params['ff_2'], params['rms_scale_2'])
+    reward_proj = (human_reward_scores[:, None] @ params['reward_proj'])[:, None, :]
+    h = h + reward_proj + sigma_t[:, :, None] * params['sigma_emb'][None, :, :]
     
-    h_frames = h_p.reshape(B, T, num_p, C)
-    ft = jnp.mean(h_frames, axis=2) + params['t_pos_emb'][:T][None, :, :]
-    q_t, k_t, v_t = map(lambda k: (ft @ params[k]).reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3), ['t_query', 't_key', 't_value'])
-    
-    t_mask = jnp.where(mask[:, None, :] & mask[:, :, None], 0.0, -1e9)[:, None, :, :] if mask is not None else None
-    attn_out_t = scaled_dot_product_attention(apply_rope(q_t), apply_rope(k_t), v_t, t_mask).transpose(0, 2, 1, 3).reshape(B, T, C)
-    h_t = rms_norm(attn_out_t + ft, params['t_rms_scale'])
-    
-    base_cond = (params['time_emb'][step_indices] + params['scale_emb'][jnp.clip(scale, 0, 127)][:, None, :] + (((bpm - 120.0) / 60.0)[:, None] @ params['bpm_proj'])[:, None, :] + params['stem_emb'][stem][:, None, :])[:, :, None, :]
-    h_frames = h_frames + jnp.expand_dims(h_t, 2) + base_cond + sigma_t[:, :, None, None] * params['sigma_emb'][None, None, None, :]
-    
-    out_encoded = rms_norm(jax.nn.gelu(h_frames @ params['up_proj_1']) @ params['up_proj_2'], params['out_rms_scale']) @ params['out_proj']
-    if modality_type == "audio":
-        return out_encoded.reshape(B, T, num_p * patch_dim)
-    return out_encoded
+    out = rms_norm(jax.nn.gelu(h @ params['up_proj_1']) @ params['up_proj_2'], params['out_rms_scale']) @ params['out_proj']
+    return out
 
 xavier_normal = lambda key, shape: jax.random.normal(key, shape) * jnp.sqrt(2.0 / (shape[-2] if len(shape) >= 2 else shape[0] + shape[-1] if len(shape) >= 2 else shape[0]))
 
-def init_params(key, dim=1024, patch_dim=441, comp_dim=512, steps=50):
-    keys = jax.random.split(key, 23)
+def init_params(key, feature_dim=FEATURE_DIM, dim=512):
+    log_to_stream("[Architecture: Init Params] Initializing functional skeletal transformer weights...")
+    keys = jax.random.split(key, 15)
     return {
-        'audio_encoder': xavier_normal(keys[0], (patch_dim, comp_dim)), 'down_proj_2': xavier_normal(keys[1], (comp_dim, dim)),
-        'token_encoder': xavier_normal(keys[22], (patch_dim, comp_dim)),
-        'query': jax.random.orthogonal(keys[2], dim), 'key': jax.random.orthogonal(keys[3], dim), 'value': jax.random.orthogonal(keys[4], dim),
-        't_query': jax.random.orthogonal(keys[5], dim), 't_key': jax.random.orthogonal(keys[6], dim), 't_value': jax.random.orthogonal(keys[7], dim),
-        'ff_1': xavier_normal(keys[8], (dim, dim * 4)), 'ff_2': xavier_normal(keys[9], (dim * 4, dim)),
-        'up_proj_1': xavier_normal(keys[10], (dim, comp_dim)), 'up_proj_2': xavier_normal(keys[11], (comp_dim, comp_dim)), 'out_proj': xavier_normal(keys[19], (comp_dim, patch_dim)),
-        'rms_scale_1': jnp.ones((dim,)), 'rms_scale_2': jnp.ones((dim,)), 't_rms_scale': jnp.ones((dim,)), 'out_rms_scale': jnp.ones((comp_dim,)),
-        'input_rms_scale': jnp.ones((1,)),
-        'scale_emb': xavier_normal(keys[12], (128, dim)), 'bpm_proj': xavier_normal(keys[13], (1, dim)), 'stem_emb': xavier_normal(keys[14], (2, dim)),
-        'time_emb': xavier_normal(keys[15], (steps, dim)), 't_pos_emb': xavier_normal(keys[16], (512, dim)), 'sigma_emb': xavier_normal(keys[18], (dim,))
+        'input_proj': xavier_normal(keys[0], (feature_dim, dim)),
+        'query': xavier_normal(keys[1], (dim, dim)), 'key': xavier_normal(keys[2], (dim, dim)), 'value': xavier_normal(keys[3], (dim, dim)),
+        'ff_1': xavier_normal(keys[4], (dim, dim * 2)), 'ff_2': xavier_normal(keys[5], (dim * 2, dim)),
+        'up_proj_1': xavier_normal(keys[6], (dim, dim)), 'up_proj_2': xavier_normal(keys[7], (dim, dim)),
+        'out_proj': xavier_normal(keys[8], (dim, feature_dim)),
+        'rms_scale_1': jnp.ones((dim,)), 'rms_scale_2': jnp.ones((dim,)), 'out_rms_scale': jnp.ones((dim,)),
+        'sigma_emb': xavier_normal(keys[9], (10, dim)),
+        'reward_proj': xavier_normal(keys[10], (1, dim))
     }
 
 # -----------------------------------------------------------------------------
 # 2. VAE Engine & RLHF Latent Alignment
 # -----------------------------------------------------------------------------
-def init_vae_params(key, latent_dim=128, input_dim=60, hidden_dim=512):
+def init_vae_params(key, latent_dim=128, input_dim=FEATURE_DIM, hidden_dim=512):
+    log_to_stream("[Architecture: VAE Init] Initializing skeletal VAE parameters...")
     keys = jax.random.split(key, 5)
     return {
         'enc_dense': xavier_normal(keys[0], (input_dim, hidden_dim)),
@@ -140,9 +116,7 @@ def init_vae_params(key, latent_dim=128, input_dim=60, hidden_dim=512):
 
 def vae_encode(vae_params, x):
     h = jax.nn.gelu(x @ vae_params['enc_dense'])
-    mean = h @ vae_params['enc_mean']
-    logvar = h @ vae_params['enc_logvar']
-    return mean, logvar
+    return h @ vae_params['enc_mean'], h @ vae_params['enc_logvar']
 
 def vae_reparameterize(key, mean, logvar):
     std = jnp.exp(0.5 * logvar)
@@ -161,15 +135,14 @@ def vae_loss_fn(vae_params, vae_state_key, x, human_scores, beta=0.01):
     recon_loss = jnp.mean(jnp.square(recon_x - x))
     kl_loss = -0.5 * jnp.mean(1 + logvar - jnp.square(mean) - jnp.exp(logvar))
     
-    reward_weight = (1.0 - human_scores)[:, None]
+    reward_weight = (1.0 - human_scores)[:, None, None]
     rlhf_penalty = jnp.mean(reward_weight * jnp.square(z))
     
     total_loss = recon_loss + beta * kl_loss + 0.1 * rlhf_penalty
     return total_loss, (recon_loss, kl_loss, rlhf_penalty)
 
-@jax.jit
 def vae_update_step(vae_params, opt_state, opt_def, key, x, scores):
-    grad_fn = jax.value_and_grad(vae_loss_fn, has_aux=True)
+    grad_fn = jax.jit(jax.value_and_grad(vae_loss_fn, has_aux=True))
     (loss, aux), grads = grad_fn(vae_params, key, x, scores)
     updates, new_opt_state = opt_def.update(grads, opt_state, vae_params)
     new_params = optax.apply_updates(vae_params, updates)
@@ -179,6 +152,7 @@ def vae_update_step(vae_params, opt_state, opt_def, key, x, scores):
 # 3. ARM64 NEON SIMD Compilation Engine
 # -----------------------------------------------------------------------------
 def compile_closed_jaxpr_to_arm64(closed_jaxpr):
+    log_to_stream("[ARM64 SIMD] Compiling closed JAXpr to ARM64 assembly instructions...")
     jaxpr = closed_jaxpr.jaxpr
     sym_name = "_jax_arm64_simd_kernel" if sys.platform == "darwin" else "jax_arm64_simd_kernel"
     
@@ -286,98 +260,104 @@ def compile_closed_jaxpr_to_arm64(closed_jaxpr):
     return "\n".join(asm), {"peak_registers": max(live_trace) if live_trace else 0, "total_regs": total_vector_regs}
 
 # -----------------------------------------------------------------------------
-# 4. API Endpoints & Training Loop
+# 4. API Endpoints & Decoupled Render Proxies
 # -----------------------------------------------------------------------------
-load_checkpoint_safely = lambda: (lambda clf: (fcntl.flock(clf, fcntl.LOCK_EX), res := (pickle.load(open(CURR_CKPT, "rb")) if os.path.exists(CURR_CKPT) else None), fcntl.flock(clf, fcntl.LOCK_UN), res)[-1])(open(CKPT_LOCK_PATH, "a+"))
-
-def get_or_create_init_seed(default_seed=42):
-    with open(INIT_SEED_PATH, "a+") as sf:
-        fcntl.flock(sf, fcntl.LOCK_EX)
+def load_checkpoint_safely(path=CURR_CKPT):
+    log_to_stream(f"[Checkpoint] Loading checkpoint bundle from path: {path}")
+    with open(CKPT_LOCK_PATH, "a+") as clf:
+        fcntl.flock(clf, fcntl.LOCK_EX)
         try:
-            sf.seek(0)
-            content = sf.read().strip()
-            seed = int(content) if content else default_seed
-            if not content:
-                sf.seek(0); sf.truncate(); sf.write(str(seed)); sf.flush()
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                with open(path, "rb") as f:
+                    res = pickle.load(f)
+            else:
+                res = None
+        except Exception as e:
+            log_to_stream(f"[Checkpoint] Error loading checkpoint: {e}")
+            res = None
         finally:
-            fcntl.flock(sf, fcntl.LOCK_UN)
-        return seed
+            fcntl.flock(clf, fcntl.LOCK_UN)
+        return res
 
 @app.get("/api/batch")
 def get_current_batch():
-    return JSONResponse({
-        "epoch": frontend_state["epoch"],
-        "batch": frontend_state["current_batch"],
-        "status": frontend_state["status_message"],
-        "real_loss": round(frontend_state["real_loss"], 5),
-        "normalized_loss": round(frontend_state["normalized_loss"], 5),
-        "current_operation": frontend_state["current_operation"]
-    })
+    with state_lock:
+        return JSONResponse({
+            "epoch": frontend_state["epoch"],
+            "batch": frontend_state["current_batch"],
+            "currentIndex": frontend_state["currentIndex"],
+            "status": frontend_state["status_message"],
+            "actual_loss": round(float(frontend_state["actual_loss"]), 5),
+            "actual_loss_range": frontend_state["actual_loss_range"],
+            "normalized_loss": round(float(frontend_state["normalized_loss"]), 5),
+            "normalized_loss_range": frontend_state["normalized_loss_range"],
+            "current_operation": frontend_state["current_operation"],
+            "is_paused": frontend_state["is_paused"]
+        })
 
 @app.post("/api/score")
 async def submit_human_scores(request: Request):
     data = await request.json()
-    scores = data.get("scores", [])
-    print(f"\n[Human Feedback Received via SolidJS for 16 items]: {scores}")
-    frontend_state["latest_scores"] = scores
-    frontend_state["waiting_for_human"] = False
-    return {"status": "success", "received_scores": scores}
+    item_id = data.get("item_id")
+    score = data.get("score", 0.5)
+    log_to_stream(f"[RLHF Feedback] Received human reward score {score} for rig variation #{item_id}")
+    
+    with state_lock:
+        frontend_state["latest_scores"][item_id] = score
+        batch = frontend_state["current_batch"]
+        if batch:
+            frontend_state["currentIndex"] = (frontend_state["currentIndex"] + 1) % len(batch)
+            
+    return {"status": "success", "item_id": item_id, "score": score}
 
-@app.post("/api/benchmark-simd")
-def benchmark_simd():
+@app.post("/api/training/control")
+async def training_control(request: Request):
+    data = await request.json()
+    action = data.get("action")
+    with state_lock:
+        if action == "pause":
+            frontend_state["is_paused"] = True
+            frontend_state["current_operation"] = "Training Paused"
+        elif action == "resume":
+            frontend_state["is_paused"] = False
+            frontend_state["current_operation"] = "Active Functional Scan Training"
+    return {"status": "success", "action": action}
+
+@app.post("/api/training/checkpoint")
+async def training_checkpoint(request: Request):
+    data = await request.json()
+    ckpt_name = data.get("checkpoint", "checkpoint_bundle.pickle")
+    with state_lock:
+        frontend_state["active_checkpoint"] = ckpt_name
+        frontend_state["status_message"] = f"Switched to checkpoint: {ckpt_name}"
+    return {"status": "success", "checkpoint": ckpt_name}
+
+@app.post("/api/render-card")
+async def proxy_render_card(request: Request):
+    body = await request.json()
     try:
-        key = jax.random.PRNGKey(42)
-        batch_x = jnp.ones((2, 4, 44100), dtype=jnp.float32)
-        sigmas = jnp.ones((2, 4), dtype=jnp.float32)
-        scales = jnp.zeros((2,), dtype=jnp.int32)
-        bpms = jnp.full((2,), 120.0, dtype=jnp.float32)
-        stems = jnp.zeros((2,), dtype=jnp.int32)
-        steps = jnp.zeros((2, 4), dtype=jnp.int32)
-        masks = jnp.ones((2, 4), dtype=bool)
-        
-        bundle = load_checkpoint_safely()
-        current_params = bundle["params"] if isinstance(bundle, dict) else bundle
-
-        def trace_fn(x):
-            cond = (scales, bpms, stems, steps, sigmas)
-            return gpt_forward(current_params, x, cond, masks, modality_type="audio")
-
-        closed_jaxpr = jax.make_jaxpr(trace_fn)(batch_x)
-        arm_asm, metrics = compile_closed_jaxpr_to_arm64(closed_jaxpr)
-
-        with open("kernel.s", "w") as f:
-            f.write(arm_asm)
-
-        link_flags = ["-shared", "-o", "./libarm.so", "kernel.s"]
-        if sys.platform == "darwin":
-            link_flags.extend(["-Wl,-exported_symbol,_jax_arm64_simd_kernel"])
-        subprocess.run(["gcc"] + link_flags, check=True)
-
-        lib_arm = ctypes.CDLL("./libarm.so")
-        data_in = np.ones(44100, dtype=np.float32)
-        data_out = np.zeros(44100, dtype=np.float32)
-
-        start = time.time()
-        for _ in range(20):
-            lib_arm.jax_arm64_simd_kernel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-            lib_arm.jax_arm64_simd_kernel(data_out.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(44100), data_in.ctypes.data_as(ctypes.c_void_p))
-        arm_time_ms = (time.time() - start) / 20 * 1000
-
-        start = time.time()
-        for _ in range(20):
-            _ = trace_fn(batch_x)
-        jax_time_ms = (time.time() - start) / 20 * 1000
-
-        return {
-            "status": "success",
-            "jax_latency_ms": round(jax_time_ms, 3),
-            "arm64_neon_latency_ms": round(arm_time_ms, 3),
-            "speedup": round(jax_time_ms / max(arm_time_ms, 0.001), 2),
-            "peak_registers": metrics["peak_registers"],
-            "total_regs": metrics["total_regs"]
-        }
+        resp = requests.post(f"{RENDER_SERVICE_URL}/api/render-card", json=body, timeout=30)
+        return resp.json()
     except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.post("/api/render-pointcloud")
+async def proxy_render_pointcloud(request: Request):
+    body = await request.json()
+    try:
+        resp = requests.post(f"{RENDER_SERVICE_URL}/api/render-pointcloud", json=body, timeout=30)
+        return resp.json()
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.post("/api/render-opengl")
+async def proxy_render_opengl(request: Request):
+    body = await request.json()
+    try:
+        resp = requests.post(f"{RENDER_SERVICE_URL}/api/render-opengl", json=body, timeout=30)
+        return resp.json()
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 @app.get("/gif/{filename}")
 def serve_gif(filename: str):
@@ -385,6 +365,9 @@ def serve_gif(filename: str):
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type="image/gif")
     return JSONResponse({"error": "GIF not found"}, status_code=404)
+
+os.makedirs("renders", exist_ok=True)
+app.mount("/renders", StaticFiles(directory="renders"), name="renders")
 
 os.makedirs("frontend/dist/assets", exist_ok=True)
 if os.path.exists("frontend/dist/assets"):
@@ -394,27 +377,25 @@ if os.path.exists("frontend/dist/assets"):
 def serve_index():
     if os.path.exists("frontend/dist/index.html"):
         return FileResponse("frontend/dist/index.html")
-    return JSONResponse({"status": "error", "message": "Frontend not built or index.html missing"}, status_code=504)
+    return JSONResponse({"status": "error", "message": "Frontend not built"}, status_code=504)
 
-def evaluate_batch_with_human_feedback(params, vae_params, batch_size=16):
-    frontend_state["current_operation"] = "JAX Diffusion Forward Pass"
-    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Running JAX diffusion forward pass for {batch_size} variations..."
+def evaluate_and_generate_batch(params, vae_params, batch_size=16):
+    with state_lock:
+        epoch = frontend_state["epoch"]
+        latest_scores_map = frontend_state.get("latest_scores", {})
     
-    key = jax.random.PRNGKey(frontend_state['epoch'] * 42)
-    dummy_input = jax.random.normal(key, (batch_size, 4, 44100))
-    dummy_conditions = (
-        jnp.zeros((batch_size,), dtype=jnp.int32),
-        jnp.full((batch_size,), 120.0, dtype=jnp.float32),
-        jnp.zeros((batch_size,), dtype=jnp.int32),
-        jnp.zeros((batch_size, 4), dtype=jnp.int32),
-        jnp.ones((batch_size, 4), dtype=jnp.float32)
-    )
+    log_to_stream(f"[Batch Generation] Sampling parametric riggings for Epoch {epoch} (Batch Size: {batch_size})")
+    scores_list = [latest_scores_map.get(i + 1, 0.5) for i in range(batch_size)]
+    reward_scores_array = jnp.array(scores_list, dtype=jnp.float32)
     
-    output = gpt_forward(params, dummy_input, dummy_conditions, modality_type="audio")
+    key = jax.random.PRNGKey(epoch * 42)
+    seq_len = 10
+    random_latent = jax.random.normal(key, (batch_size, seq_len, 128))
+    sampled_features = vae_decode(vae_params, random_latent)
     
     batch_metadata = []
     for i in range(batch_size):
-        p = output[i, 0, :]
+        p = sampled_features[i, 0, :]
         bone_transforms = {}
         param_idx = 0
         for bone in SKELETAL_BONES:
@@ -433,95 +414,83 @@ def evaluate_batch_with_human_feedback(params, vae_params, batch_size=16):
             "mass": round(mass, 1),
             "height": round(height, 2),
             "bone_transforms": bone_transforms,
-            "preview_url": f"/gif/rigged_scene_var_{i+1}_epoch_{frontend_state['epoch']}.gif"
+            "preview_url": f"/gif/rigged_scene_var_{i+1}_epoch_{epoch}.gif"
         })
 
-    frontend_state["current_batch"] = batch_metadata
-    frontend_state["current_operation"] = "Waiting for Human RLHF Scoring"
-    frontend_state["waiting_for_human"] = True
-    frontend_state["status_message"] = f"Epoch {frontend_state['epoch']}: Waiting for human RLHF scoring on {batch_size} variations..."
-    
-    while frontend_state["waiting_for_human"]:
-        time.sleep(0.5)
-        
-    scores = frontend_state["latest_scores"]
-    if not scores or len(scores) != batch_size:
-        scores = [0.5] * batch_size
-        
-    return jnp.array(scores)
+    with state_lock:
+        if not frontend_state["is_paused"]:
+            frontend_state["current_batch"] = batch_metadata
+            frontend_state["current_operation"] = "Active Functional Scan Training"
+            frontend_state["status_message"] = f"Epoch {epoch}: Parametric rigging batch generated."
+
+    return reward_scores_array, sampled_features
 
 def run_training_loop(params, vae_params):
+    log_to_stream("[Training Thread] Background functional scan VAE training thread initialized...")
     global_step = 0
     vae_opt_def = optax.adam(3e-4)
     vae_opt_state = vae_opt_def.init(vae_params)
+    peak_loss_tracker = 1.0  
     
     try:
         while True:
-            frontend_state["epoch"] = global_step + 1
-            frontend_state["current_operation"] = "Batch Evaluation & JAX Forward Pass"
+            with state_lock:
+                paused = frontend_state["is_paused"]
             
-            batch_scores = evaluate_batch_with_human_feedback(params, vae_params, batch_size=16)
-            
-            frontend_state["current_operation"] = "Feature Extraction & VAE Update"
-            batch_features = []
-            for item in frontend_state["current_batch"]:
-                feat = []
-                for bone in SKELETAL_BONES:
-                    b_cfg = item["bone_transforms"].get(bone, {"freq": 1.0, "amp": 0.2, "axis": 'x'})
-                    axis_val = -1.0 if b_cfg["axis"] == 'x' else (1.0 if b_cfg["axis"] == 'y' else 0.0)
-                    feat.extend([b_cfg["freq"], b_cfg["amp"], axis_val])
-                feat.extend([item["mass"] / 100.0, item["height"] / 2.0])
-                batch_features.append(feat)
-            
-            x_batch = jnp.array(batch_features, dtype=jnp.float32)
-            key = jax.random.PRNGKey(global_step)
-            
-            vae_params, vae_opt_state, vae_loss, aux = vae_update_step(
-                vae_params, vae_opt_state, vae_opt_def, key, x_batch, batch_scores
-            )
-            
-            frontend_state["real_loss"] = float(aux[0])
-            frontend_state["normalized_loss"] = float(vae_loss)
-            
-            print(f"[VAE RLHF Training] Step {global_step:04d} | Real Loss: {aux[0]:.4f} | Normalized Loss: {vae_loss:.4f} | KL: {aux[1]:.4f} | Penalty: {aux[2]:.4f}")
-            global_step += 1
-    except Exception as e:
-        print(f"Training loop error: {e}")
+            if paused:
+                with state_lock:
+                    frontend_state["current_operation"] = "Training Paused"
+                time.sleep(0.5)
+                continue
 
-os.makedirs("renders", exist_ok=True)
-app.mount("/renders", StaticFiles(directory="renders"), name="renders")
+            with state_lock:
+                frontend_state["epoch"] = global_step + 1
+            
+            batch_scores, x_batch = evaluate_and_generate_batch(params, vae_params, batch_size=16)
+            
+            num_repeat_training_steps = 3
+            for repeat_step in range(num_repeat_training_steps):
+                key = jax.random.PRNGKey(global_step * 10 + repeat_step)
+                vae_params, vae_opt_state, vae_loss, aux = vae_update_step(
+                    vae_params, vae_opt_state, vae_opt_def, key, x_batch, batch_scores
+                )
+            
+            peak_loss_tracker = float(jnp.maximum(peak_loss_tracker, vae_loss))
+            norm_loss = float(jnp.clip(vae_loss / peak_loss_tracker, 0.0, 1.0))
+
+            with state_lock:
+                frontend_state["actual_loss"] = float(vae_loss)
+                frontend_state["normalized_loss"] = norm_loss
+            
+            log_to_stream(f"[Training Step {global_step:04d}] Actual Loss [0, inf): {vae_loss:.4f} | Normalized Loss [0, 1]: {norm_loss:.4f}")
+
+            global_step += 1
+            time.sleep(0.1)
+    except Exception as e:
+        log_to_stream(f"[Training Loop Error] {e}")
 
 if __name__ == "__main__":
     os.makedirs("data", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("ntk_logs", exist_ok=True)
-    
-    optimizer = optax.adam(1e-4)
-    seed_key = get_or_create_init_seed(42)
     
     with open(CKPT_LOCK_PATH, "a+") as clf:
         fcntl.flock(clf, fcntl.LOCK_EX)
         try:
-            if not os.path.exists(CURR_CKPT):
-                init_p = init_params(jax.random.PRNGKey(seed_key))
-                init_vae_p = init_vae_params(jax.random.PRNGKey(seed_key + 1))
-                pickle.dump({
-                    "params": init_p, 
-                    "ema_params": init_p,
-                    "vae_params": init_vae_p,
-                    "opt_state": optimizer.init(init_p), 
-                    "version": 0, 
-                    "global_step": 0
-                }, open(CURR_CKPT, "wb"))
+            clf.seek(0)
+            if not os.path.exists(CURR_CKPT) or os.path.getsize(CURR_CKPT) == 0:
+                log_to_stream("[Main] Initializing scan-optimized skeletal checkpoint bundle...")
+                init_p = init_params(jax.random.PRNGKey(42))
+                init_vae_p = init_vae_params(jax.random.PRNGKey(43))
+                pickle.dump({"params": init_p, "vae_params": init_vae_p}, open(CURR_CKPT, "wb"))
         finally:
             fcntl.flock(clf, fcntl.LOCK_UN)
 
     bundle = load_checkpoint_safely()
-    params = bundle["params"] if isinstance(bundle, dict) and "params" in bundle else bundle
-    vae_params = bundle["vae_params"] if isinstance(bundle, dict) and "vae_params" in bundle else init_vae_params(jax.random.PRNGKey(43))
+    params = bundle["params"]
+    vae_params = bundle["vae_params"]
 
     training_thread = threading.Thread(target=run_training_loop, args=(params, vae_params), daemon=True)
     training_thread.start()
 
-    print("[Daemon] Starting Decoupled FastAPI server on port 8000...")
+    log_to_stream("[Daemon] Starting FastAPI server on port 8000 for lax.scan optimized skeletal training...")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
