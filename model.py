@@ -518,7 +518,8 @@ def run_training_loop(params, vae_params):
     global_step = 0
     vae_opt_def = optax.adam(3e-4)
     vae_opt_state = vae_opt_def.init(vae_params)
-    peak_loss_tracker = 1.0  
+    
+    loss_history = deque(maxlen=50)
     
     initialize_rlhf_buffer(vae_params)
 
@@ -559,18 +560,27 @@ def run_training_loop(params, vae_params):
                     vae_params, vae_opt_state, vae_opt_def, step_key, x_batch, reward_scores_array, has_score_mask
                 )
             
-            peak_loss_tracker = float(jnp.maximum(peak_loss_tracker, vae_loss))
-            norm_loss = float(jnp.clip(vae_loss / peak_loss_tracker, 0.0, 1.0))
+            loss_val = float(vae_loss)
+            loss_history.append(loss_val)
+            
+            min_l = min(loss_history)
+            max_l = max(loss_history)
+            if max_l - min_l > 1e-6:
+                norm_loss = float(jnp.clip((loss_val - min_l) / (max_l - min_l + 1e-6), 0.05, 0.95))
+            else:
+                norm_loss = 0.5
 
             with state_lock:
-                frontend_state["actual_loss"] = float(vae_loss)
+                frontend_state["actual_loss"] = loss_val
                 frontend_state["normalized_loss"] = norm_loss
                 frontend_state["current_operation"] = f"Logging Step {global_step} (Loss Normalization)"
             
-            log_to_stream(f"[Training Step {global_step:04d}] Actual Loss [0, inf): {vae_loss:.4f} | Normalized Loss [0, 1]: {norm_loss:.4f}")
+            log_to_stream(f"[Training Step {global_step:04d}] Actual Loss [0, inf): {loss_val:.4f} | Normalized Loss [0, 1]: {norm_loss:.4f}")
 
             if global_step % 100 == 0:
-                save_checkpoint_safely({"params": params, "vae_params": vae_params}, CURR_CKPT)
+                with state_lock:
+                    ckpt = frontend_state["active_checkpoint"]
+                save_checkpoint_safely({"params": params, "vae_params": vae_params}, ckpt)
 
             global_step += 1
             time.sleep(0.1)

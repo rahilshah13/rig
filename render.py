@@ -30,28 +30,28 @@ def generate_procedural_glb(var_id, epoch, bone_transforms=None):
     scene = trimesh.Scene()
     
     hips = trimesh.creation.icosphere(subdivisions=3, radius=0.22)
-    hips.visual.vertex_colors = [210, 215, 220, 255]
+    hips.visual.vertex_colors = np.tile([210, 215, 220, 255], (len(hips.vertices), 1))
     scene.add_geometry(hips, node_name="Hips")
     
     spine = trimesh.creation.cylinder(radius=0.09, height=1.0, sections=16)
     spine.apply_translation([0, 0.5, 0])
-    spine.visual.vertex_colors = [100, 110, 125, 255]
+    spine.visual.vertex_colors = np.tile([100, 110, 125, 255], (len(spine.vertices), 1))
     scene.add_geometry(spine, node_name="Spine")
     
     head = trimesh.creation.icosphere(subdivisions=3, radius=0.26)
     head.apply_translation([0, 1.1, 0])
-    head.visual.vertex_colors = [240, 220, 205, 255]
+    head.visual.vertex_colors = np.tile([240, 220, 205, 255], (len(head.vertices), 1))
     scene.add_geometry(head, node_name="Head")
     
     for side, x_sign in [("Left", -1), ("Right", 1)]:
         arm = trimesh.creation.cylinder(radius=0.06, height=0.8, sections=12)
         arm.apply_translation([x_sign * 0.5, 0.6, 0])
-        arm.visual.vertex_colors = [90, 100, 115, 255]
+        arm.visual.vertex_colors = np.tile([90, 100, 115, 255], (len(arm.vertices), 1))
         scene.add_geometry(arm, node_name=f"{side}Arm")
         
         leg = trimesh.creation.cylinder(radius=0.07, height=0.9, sections=12)
         leg.apply_translation([x_sign * 0.25, -0.5, 0])
-        leg.visual.vertex_colors = [70, 80, 95, 255]
+        leg.visual.vertex_colors = np.tile([70, 80, 95, 255], (len(leg.vertices), 1))
         scene.add_geometry(leg, node_name=f"{side}Leg")
         
     os.makedirs("renders", exist_ok=True)
@@ -127,11 +127,13 @@ async def api_render_card(request: Request):
         var_id = data.get("var_id", 1)
         epoch = data.get("epoch", 1)
         preset = data.get("preset", "isometric")
-        duration_sec = max(4, min(30, int(data.get("duration_sec", 6))))
+        duration_sec = max(2, min(10, int(data.get("duration_sec", 4))))
         
         glb_path = generate_procedural_glb(var_id, epoch, data.get("bone_transforms"))
         output_filename = f"var_{var_id}_epoch_{epoch}_{preset}.mp4"
+        gif_filename = f"rigged_scene_var_{var_id}_epoch_{epoch}.gif"
         output_path = os.path.join("renders", output_filename)
+        gif_path = os.path.join("renders", gif_filename)
         
         scene = trimesh.load(glb_path)
         preset_cfg = PRESETS.get(preset, PRESETS["isometric"])
@@ -151,7 +153,10 @@ async def api_render_card(request: Request):
                     if hasattr(geom, 'vertices') and hasattr(geom, 'faces'):
                         verts = geom.vertices
                         faces = geom.faces
-                        vertex_colors = getattr(geom.visual, 'vertex_colors', np.array([[200, 200, 200, 255]] * len(verts)))
+                        
+                        vertex_colors = getattr(geom.visual, 'vertex_colors', None)
+                        if vertex_colors is None or len(vertex_colors) != len(verts):
+                            vertex_colors = np.tile([200, 200, 200, 255], (len(verts), 1))
                         
                         for face in faces:
                             v0, v1, v2 = verts[face[0]], verts[face[1]], verts[face[2]]
@@ -165,20 +170,34 @@ async def api_render_card(request: Request):
                             p1 = project_vertex(v1, azim, base_elev)
                             p2 = project_vertex(v2, azim, base_elev)
                             
-                            color = vertex_colors[face[0]] if len(vertex_colors) > face[0] else [200, 200, 200, 255]
+                            color = vertex_colors[face[0]] if face[0] < len(vertex_colors) else [200, 200, 200, 255]
                             rasterize_triangle(frame_buffer, depth_buffer, p0, p1, p2, color, normal)
                 
                 f_out.write(frame_buffer.tobytes())
 
+        # Render MP4
         subprocess.run([
             "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{W}x{H}", "-r", str(FPS), "-i", raw_path,
             "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        # Render true animated GIF for the GIF viewport button
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{W}x{H}", "-r", "15", "-i", raw_path,
+            "-vf", "fps=15,scale=240:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+            gif_path
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         if os.path.exists(raw_path):
             os.remove(raw_path)
-        return {"status": "success", "video_url": f"/renders/{output_filename}", "duration_sec": duration_sec}
+        return {
+            "status": "success", 
+            "video_url": f"/renders/{output_filename}", 
+            "gif_url": f"/renders/{gif_filename}",
+            "duration_sec": duration_sec
+        }
 
     try:
         loop = asyncio.get_event_loop()
