@@ -70,8 +70,22 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /build/frontend/dist /app/frontend/dist
 COPY . /app
 
+# Setup default fallback checkpoints and generate entrypoint script for persistent volume mounts
+RUN mkdir -p /app/checkpoints_default && cp -r checkpoints/* /app/checkpoints_default/ 2>/dev/null || true
+
+RUN printf '#!/bin/sh\n\
+set -e\n\
+if [ ! -f /app/checkpoints/checkpoint_bundle.pickle ]; then\n\
+    echo "[Entrypoint] Initializing persistent checkpoints directory..."\n\
+    mkdir -p /app/checkpoints\n\
+    if [ -f /app/checkpoints_default/checkpoint_bundle.pickle ]; then\n\
+        cp /app/checkpoints_default/* /app/checkpoints/\n\
+    fi\n\
+fi\n\
+exec "$@"\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
 EXPOSE 8000
 EXPOSE 8001
 
-# Run render.py on port 8001 and model.py on port 8000 concurrently
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["sh", "-c", "python render.py 8001 & python model.py"]
