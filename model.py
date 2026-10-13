@@ -569,7 +569,7 @@ def run_training_loop(params, vae_params):
             
             log_to_stream(f"[Training Step {global_step:04d}] Actual Loss [0, inf): {vae_loss:.4f} | Normalized Loss [0, 1]: {norm_loss:.4f}")
 
-            if global_step % 5 == 0:
+            if global_step % 100 == 0:
                 save_checkpoint_safely({"params": params, "vae_params": vae_params}, CURR_CKPT)
 
             global_step += 1
