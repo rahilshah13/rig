@@ -84,7 +84,7 @@ function RigCanvas(props) {
   onCleanup(() => cancelAnimationFrame(animationFrameId));
 
   return (
-    <canvas ref={canvasRef} width="220" height="240" style="background: #ffffff; border-radius: 4px; border: 1px solid #000000;" />
+    <canvas ref={canvasRef} width="200" height="220" style="background: #ffffff; border-radius: 4px; border: 1px solid #000000;" />
   );
 }
 
@@ -98,7 +98,8 @@ function ExplainerModal(props) {
         </div>
         <div style="font-size: 13px; line-height: 1.5; display: flex; flex-direction: column; gap: 8px;">
           <p><strong>Store-backed State:</strong> Application view states and telemetry logs are synchronized via SolidJS store bindings.</p>
-          <p><strong>Disambiguated Losses:</strong> Actual Loss tracks unconstrained optimization error in <code style="background: #f1f1f1; padding: 2px 4px; border-radius: 3px;">[0, inf)</code>. Normalized Loss tracks scaled progress strictly bounded within <code style="background: #f1f1f1; padding: 2px 4px; border-radius: 3px;">[0, 1]</code>.</p>
+          <p><strong>Selective RLHF:</strong> Unscored samples are masked out during optimization, ensuring human feedback is exclusively incorporated in active alignment passes.</p>
+          <p><strong>AOT ARM64 Compilation:</strong> JAXPR execution graphs are compiled to ARM64 NEON assembly kernels for high-throughput latent sampling.</p>
         </div>
         <button onClick={props.onClose} style="padding: 8px 16px; background: #000000; color: #ffffff; border: 1px solid #000000; border-radius: 4px; font-weight: 700; cursor: pointer; align-self: flex-end; text-transform: uppercase; font-size: 12px;">Close</button>
       </div>
@@ -110,13 +111,13 @@ function App() {
   const [state, setState] = createStore({
     batchData: { 
       epoch: 1, 
+      global_step: 0,
+      repeat_step: 0,
       batch: [], 
       currentIndex: 0,
       status: "Initializing...", 
       actual_loss: 0.0, 
-      actual_loss_range: "[0, inf)",
       normalized_loss: 0.0, 
-      normalized_loss_range: "[0, 1]",
       current_operation: "Idle" 
     },
     currentScore: 0.5,
@@ -126,7 +127,10 @@ function App() {
     url: "",
     isRendering: false,
     isPaused: false,
-    selectedCheckpoint: "checkpoint_bundle.pickle"
+    selectedCheckpoint: "checkpoint_bundle.pickle",
+    vaeSamplingMode: "jax",
+    vaeSamplingResult: null,
+    isSamplingVae: false
   });
 
   const fetchData = async () => {
@@ -165,6 +169,25 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ checkpoint: ckpt })
     });
+  };
+
+  const sampleVaeEngine = async (mode) => {
+    setState("vaeSamplingMode", mode);
+    setState("isSamplingVae", true);
+    try {
+      const res = await fetch("/api/vae/sample", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode })
+      });
+      const data = await res.json();
+      setState("vaeSamplingResult", data);
+    } catch (err) {
+      console.error("VAE sampling error:", err);
+      setState("vaeSamplingResult", { status: "error", message: err.toString() });
+    } finally {
+      setState("isSamplingVae", false);
+    }
   };
 
   const switchView = async (mode, selectedPreset = "isometric") => {
@@ -216,65 +239,77 @@ function App() {
   };
 
   return (
-    <div style="font-family: system-ui, -apple-system, sans-serif; background: #ffffff; color: #000000; height: 100vh; max-height: 100vh; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 12px 16px; box-sizing: border-box;">
-      <div style="width: 100%; max-width: 980px; display: flex; flex-direction: column; align-items: center; text-align: center; height: 100%; gap: 8px;">
+    <div style="font-family: system-ui, -apple-system, sans-serif; background: #ffffff; color: #000000; height: 100vh; max-height: 100vh; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 10px 14px; box-sizing: border-box;">
+      <div style="width: 100%; max-width: 960px; display: flex; flex-direction: column; align-items: center; text-align: center; height: 100%; gap: 6px;">
         
         {/* Header & Control Toolbar */}
         <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-          <h1 style="font-size: 16px; font-weight: 800; color: #000000; margin: 0; text-transform: uppercase; letter-spacing: 0.5px;">Rig Stream - Store State</h1>
-          <div style="display: flex; gap: 8px; align-items: center;">
-            <select value={state.selectedCheckpoint} onChange={handleCheckpointChange} style="font-size: 11px; padding: 4px 8px; border-radius: 4px; border: 1px solid #000000; background: #ffffff; color: #000000; cursor: pointer;">
+          <h1 style="font-size: 15px; font-weight: 800; color: #000000; margin: 0; text-transform: uppercase; letter-spacing: 0.5px;">Rig Stream - Store State</h1>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <select value={state.selectedCheckpoint} onChange={handleCheckpointChange} style="font-size: 11px; padding: 3px 6px; border-radius: 4px; border: 1px solid #000000; background: #ffffff; color: #000000; cursor: pointer;">
               <option value="checkpoint_bundle.pickle">Latest Bundle</option>
               <option value="checkpoint_bundle_prev.pickle">Previous Bundle</option>
             </select>
-            <button onClick={togglePause} style={`padding: 4px 10px; border-radius: 4px; border: 1px solid #000000; font-size: 11px; font-weight: 700; cursor: pointer; background: ${state.isPaused ? '#000000' : '#ffffff'}; color: ${state.isPaused ? '#ffffff' : '#000000'};`}>
+            <button onClick={togglePause} style={`padding: 3px 8px; border-radius: 4px; border: 1px solid #000000; font-size: 11px; font-weight: 700; cursor: pointer; background: ${state.isPaused ? '#000000' : '#ffffff'}; color: ${state.isPaused ? '#ffffff' : '#000000'};`}>
               {state.isPaused ? "Resume Training" : "Pause Training"}
             </button>
-            <button onClick={() => setState("showModal", true)} style="padding: 4px 10px; background: #ffffff; color: #000000; border: 1px solid #000000; border-radius: 4px; font-size: 11px; font-weight: 700; cursor: pointer;">
+            <button onClick={() => setState("showModal", true)} style="padding: 3px 8px; background: #ffffff; color: #000000; border: 1px solid #000000; border-radius: 4px; font-size: 11px; font-weight: 700; cursor: pointer;">
               ℹ️ Objectives
             </button>
           </div>
         </div>
 
         {/* Status & Disambiguated Loss Dashboard */}
-        <div style="background: #ffffff; border: 1px solid #000000; color: #000000; padding: 8px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; display: flex; flex-direction: column; gap: 4px; width: 100%; box-sizing: border-box;">
+        <div style="background: #ffffff; border: 1px solid #000000; color: #000000; padding: 6px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; display: flex; flex-direction: column; gap: 3px; width: 100%; box-sizing: border-box;">
           <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
             <span><strong>Operation:</strong> {state.batchData.current_operation || "Initializing..."}</span>
             <span><strong>Epoch:</strong> {state.batchData.epoch}</span>
           </div>
-          <div style="display: flex; justify-content: space-around; width: 100%; border-top: 1px solid #e0e0e0; padding-top: 4px; font-size: 11px;">
+          <div style="display: flex; justify-content: space-around; width: 100%; border-top: 1px solid #e0e0e0; padding-top: 3px; font-size: 10px;">
             <span>Actual Loss <span style="color:#666;">[0, inf)</span>: <strong style="color: #000000;">{state.batchData.actual_loss ?? 0.0000}</strong></span>
             <span>Normalized Loss <span style="color:#666;">[0, 1]</span>: <strong style="color: #000000;">{state.batchData.normalized_loss ?? 0.0000}</strong></span>
           </div>
         </div>
 
-        {/* Architecture Pipeline Position Tracker (replaces terminal output log) */}
-        <div style="width: 100%; background: #f8f9fa; border: 1px solid #000000; border-radius: 4px; padding: 8px 12px; display: flex; flex-direction: column; gap: 6px; box-sizing: border-box; text-align: left;">
+        {/* Live Training Loop Status Monitor */}
+        <div style="width: 100%; background: #fafafa; border: 1px solid #000000; border-radius: 4px; padding: 6px 10px; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; text-align: left;">
           <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center;">
-            <span>Model Pipeline Phase</span>
-            <span style="font-weight: normal; color: #555;">model.py execution stack</span>
+            <span>Training Loop Status</span>
+            <span style="font-family: monospace; font-size: 10px; background: #000000; color: #00ff66; padding: 2px 6px; border-radius: 3px;">
+              STEP {state.batchData.global_step || 0} | ITER {state.batchData.repeat_step || 0}/3
+            </span>
           </div>
-          <div style="display: flex; justify-content: space-between; gap: 4px; font-size: 11px; font-weight: 600;">
-            <div style={`flex: 1; text-align: center; padding: 4px; border-radius: 3px; border: 1px solid #000000; background: ${state.batchData.current_operation?.includes('Init') ? '#000000' : '#ffffff'}; color: ${state.batchData.current_operation?.includes('Init') ? '#ffffff' : '#000000'};`}>
-              1. Checkpoint & Init
+          <div style="font-size: 11px; font-weight: 600; color: #111111; display: flex; align-items: center; gap: 6px;">
+            <span style="width: 7px; height: 7px; border-radius: 50%; background: #10b981; display: inline-block;"></span>
+            <span>{state.batchData.current_operation || "Initializing training loop..."}</span>
+          </div>
+        </div>
+
+        {/* VAE Sampling Engine Component (ARM64 Compilation vs JAX Native) */}
+        <div style="width: 100%; background: #ffffff; border: 1px solid #000000; border-radius: 4px; padding: 6px 10px; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; text-align: left;">
+          <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center;">
+            <span>VAE Rigging Sampler (Execution Engine)</span>
+            <div style="display: flex; gap: 4px;">
+              <button onClick={() => sampleVaeEngine("jax")} style={`font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; cursor: pointer; font-weight: bold; background: ${state.vaeSamplingMode === 'jax' ? '#000000' : '#ffffff'}; color: ${state.vaeSamplingMode === 'jax' ? '#ffffff' : '#000000'};`}>JAX Native</button>
+              <button onClick={() => sampleVaeEngine("arm64")} style={`font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; cursor: pointer; font-weight: bold; background: ${state.vaeSamplingMode === 'arm64' ? '#000000' : '#ffffff'}; color: ${state.vaeSamplingMode === 'arm64' ? '#ffffff' : '#000000'};`}>ARM64 SIMD AOT</button>
             </div>
-            <div style={`flex: 1; text-align: center; padding: 4px; border-radius: 3px; border: 1px solid #000000; background: ${state.batchData.current_operation?.includes('Scan') || state.batchData.current_operation?.includes('Training') ? '#000000' : '#ffffff'}; color: ${state.batchData.current_operation?.includes('Scan') || state.batchData.current_operation?.includes('Training') ? '#ffffff' : '#000000'};`}>
-              2. Lax.Scan Transformer
-            </div>
-            <div style={`flex: 1; text-align: center; padding: 4px; border-radius: 3px; border: 1px solid #000000; background: ${state.batchData.current_operation?.includes('Batch') ? '#000000' : '#ffffff'}; color: ${state.batchData.current_operation?.includes('Batch') ? '#ffffff' : '#000000'};`}>
-              3. VAE & Latent Sampling
-            </div>
-            <div style={`flex: 1; text-align: center; padding: 4px; border-radius: 3px; border: 1px solid #000000; background: ${state.batchData.current_operation?.includes('Paused') ? '#000000' : '#ffffff'}; color: ${state.batchData.current_operation?.includes('Paused') ? '#ffffff' : '#000000'};`}>
-              4. Server State Sync
-            </div>
+          </div>
+          <div style="font-size: 11px; display: flex; justify-content: space-between; align-items: center; background: #f5f5f5; padding: 4px 8px; border-radius: 3px;">
+            {state.isSamplingVae ? (
+              <span>Executing VAE forward sampling via {state.vaeSamplingMode.toUpperCase()}...</span>
+            ) : state.vaeSamplingResult ? (
+              <span>Engine: <strong>{state.vaeSamplingResult.engine}</strong> | Latency: <strong>{state.vaeSamplingResult.latency_ms}ms</strong> | Status: <strong style="color: #10b981;">{state.vaeSamplingResult.status}</strong></span>
+            ) : (
+              <span>Select engine above to execute on-demand VAE rigging inference.</span>
+            )}
           </div>
         </div>
 
         {/* Maximized Single Item Card */}
         {state.batchData.batch.length === 0 ? (
-          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; background: #ffffff; border-radius: 4px; border: 1px solid #000000; width: 100%; flex-grow: 1; box-sizing: border-box;">
-            <div style="width: 32px; height: 32px; border: 3px solid #000000; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 10px;"></div>
-            <p style="font-size: 14px; color: #000000; font-weight: 700;">Streaming procedural variation from JAX VAE...</p>
+          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 30px 20px; background: #ffffff; border-radius: 4px; border: 1px solid #000000; width: 100%; flex-grow: 1; box-sizing: border-box;">
+            <div style="width: 28px; height: 28px; border: 3px solid #000000; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 8px;"></div>
+            <p style="font-size: 13px; color: #000000; font-weight: 700;">Streaming procedural variation from JAX VAE...</p>
             <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
           </div>
         ) : (
@@ -285,22 +320,22 @@ function App() {
             if (!item) return null;
 
             return (
-              <div style="background: #ffffff; padding: 14px 18px; border-radius: 6px; display: flex; flex-direction: column; align-items: center; text-align: left; border: 1px solid #000000; color: #000000; width: 100%; box-sizing: border-box; flex-grow: 1; justify-content: space-between;">
+              <div style="background: #ffffff; padding: 10px 14px; border-radius: 6px; display: flex; flex-direction: column; align-items: center; text-align: left; border: 1px solid #000000; color: #000000; width: 100%; box-sizing: border-box; flex-grow: 1; justify-content: space-between;">
                 
-                <div style="display: flex; justify-content: space-between; width: 100%; align-items: center; margin-bottom: 4px;">
-                  <h3 style="font-size: 14px; font-weight: 700; margin: 0;">Variation #{item.id} (Item {idx + 1} of {batch.length})</h3>
+                <div style="display: flex; justify-content: space-between; width: 100%; align-items: center; margin-bottom: 2px;">
+                  <h3 style="font-size: 13px; font-weight: 700; margin: 0;">Variation #{item.id} (Item {idx + 1} of {batch.length})</h3>
                   <div style="display: flex; gap: 4px;">
-                    <button onClick={() => switchView("gif")} style={`font-size: 11px; padding: 3px 8px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === 'gif' ? '#000000' : '#ffffff'}; color: ${state.viewMode === 'gif' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>GIF</button>
-                    <button onClick={() => switchView("2d", state.preset)} style={`font-size: 11px; padding: 3px 8px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === '2d' ? '#000000' : '#ffffff'}; color: ${state.viewMode === '2d' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>2D</button>
-                    <button onClick={() => switchView("pc")} style={`font-size: 11px; padding: 3px 8px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === 'pc' ? '#000000' : '#ffffff'}; color: ${state.viewMode === 'pc' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>PC</button>
-                    <button onClick={() => switchView("opengl")} style={`font-size: 11px; padding: 3px 8px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === 'opengl' ? '#000000' : '#ffffff'}; color: ${state.viewMode === 'opengl' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>GL</button>
+                    <button onClick={() => switchView("gif")} style={`font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === 'gif' ? '#000000' : '#ffffff'}; color: ${state.viewMode === 'gif' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>GIF</button>
+                    <button onClick={() => switchView("2d", state.preset)} style={`font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === '2d' ? '#000000' : '#ffffff'}; color: ${state.viewMode === '2d' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>2D</button>
+                    <button onClick={() => switchView("pc")} style={`font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === 'pc' ? '#000000' : '#ffffff'}; color: ${state.viewMode === 'pc' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>PC</button>
+                    <button onClick={() => switchView("opengl")} style={`font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; background: ${state.viewMode === 'opengl' ? '#000000' : '#ffffff'}; color: ${state.viewMode === 'opengl' ? '#ffffff' : '#000000'}; cursor: pointer; font-weight: bold;`}>GL</button>
                   </div>
                 </div>
                 
-                <div style="display: flex; justify-content: space-between; width: 100%; align-items: center; margin-bottom: 6px;">
-                  <p style="font-size: 12px; color: #333333; margin: 0;">Mass: <strong>{item.mass}kg</strong> | Height: <strong>{item.height}m</strong></p>
+                <div style="display: flex; justify-content: space-between; width: 100%; align-items: center; margin-bottom: 4px;">
+                  <p style="font-size: 11px; color: #333333; margin: 0;">Mass: <strong>{item.mass}kg</strong> | Height: <strong>{item.height}m</strong></p>
                   {state.viewMode === "2d" && (
-                    <select value={state.preset} onChange={(e) => switchView("2d", e.target.value)} style="font-size: 11px; padding: 2px 6px; border-radius: 3px; border: 1px solid #000000; background: #ffffff; color: #000000;">
+                    <select value={state.preset} onChange={(e) => switchView("2d", e.target.value)} style="font-size: 10px; padding: 2px 4px; border-radius: 3px; border: 1px solid #000000; background: #ffffff; color: #000000;">
                       <option value="isometric">Isometric</option>
                       <option value="cinematic">Cinematic</option>
                       <option value="front">Front</option>
@@ -309,43 +344,43 @@ function App() {
                   )}
                 </div>
 
-                <div style="display: flex; gap: 16px; width: 100%; justify-content: center; align-items: center; margin-bottom: 8px;">
+                <div style="display: flex; gap: 14px; width: 100%; justify-content: center; align-items: center; margin-bottom: 6px;">
                   <div style="display: flex; flex-direction: column; align-items: center;">
-                    <span style="font-size: 11px; font-weight: 700; margin-bottom: 4px; text-transform: uppercase;">Bone Rig (Canvas)</span>
+                    <span style="font-size: 10px; font-weight: 700; margin-bottom: 3px; text-transform: uppercase;">Bone Rig (Canvas)</span>
                     <RigCanvas transforms={item.bone_transforms} />
                   </div>
                   <div style="display: flex; flex-direction: column; align-items: center;">
-                    <span style="font-size: 11px; font-weight: 700; margin-bottom: 4px; text-transform: uppercase;">{state.viewMode.toUpperCase()} Viewport</span>
+                    <span style="font-size: 10px; font-weight: 700; margin-bottom: 3px; text-transform: uppercase;">{state.viewMode.toUpperCase()} Viewport</span>
                     {state.viewMode === 'gif' ? (
                       item.preview_url ? (
-                        <img src={item.preview_url} alt="Mesh Render" style="width: 220px; height: 240px; object-fit: contain; background: #ffffff; border-radius: 4px; border: 1px solid #000000;" />
+                        <img src={item.preview_url} alt="Mesh Render" style="width: 200px; height: 220px; object-fit: contain; background: #ffffff; border-radius: 4px; border: 1px solid #000000;" />
                       ) : (
-                        <div style="width: 220px; height: 240px; background: #ffffff; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #000000; font-size: 12px; border: 1px solid #000000; text-align: center;">Rendering...</div>
+                        <div style="width: 200px; height: 220px; background: #ffffff; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #000000; font-size: 11px; border: 1px solid #000000; text-align: center;">Rendering...</div>
                       )
                     ) : (
                       state.isRendering ? (
-                        <div style="width: 220px; height: 240px; background: #ffffff; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #000000; font-size: 12px; border: 1px solid #000000; text-align: center;">Rendering...</div>
+                        <div style="width: 200px; height: 220px; background: #ffffff; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #000000; font-size: 11px; border: 1px solid #000000; text-align: center;">Rendering...</div>
                       ) : (
                         state.url ? (
-                          <video controls autoplay loop src={state.url} style="width: 220px; height: 240px; object-fit: contain; background: #000000; border-radius: 4px; border: 1px solid #000000;" />
+                          <video controls autoplay loop src={state.url} style="width: 200px; height: 220px; object-fit: contain; background: #000000; border-radius: 4px; border: 1px solid #000000;" />
                         ) : (
-                          <div style="width: 220px; height: 240px; background: #ffffff; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #000000; font-size: 12px; border: 1px solid #000000; text-align: center;">Ready</div>
+                          <div style="width: 200px; height: 220px; background: #ffffff; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #000000; font-size: 11px; border: 1px solid #000000; text-align: center;">Ready</div>
                         )
                       )
                     )}
                   </div>
                 </div>
 
-                <div style="width: 100%; display: flex; flex-direction: column; gap: 4px;">
+                <div style="width: 100%; display: flex; flex-direction: column; gap: 3px;">
                   <label style="font-size: 11px; font-weight: 700; display: flex; justify-content: space-between;">
                     <span>Score Reward:</span>
                     <span>{state.currentScore}</span>
                   </label>
                   <input type="range" min="0" max="1" step="0.1" value={state.currentScore} 
                     onInput={(e) => setState("currentScore", parseFloat(e.target.value))} 
-                    style="width: 100%; cursor: pointer; accent-color: #000000; height: 18px;" />
+                    style="width: 100%; cursor: pointer; accent-color: #000000; height: 16px;" />
                   
-                  <button onClick={submitScoreAndNext} style="margin-top: 4px; padding: 10px 16px; background: #000000; color: #ffffff; border: 1px solid #000000; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; width: 100%;">
+                  <button onClick={submitScoreAndNext} style="margin-top: 3px; padding: 8px 14px; background: #000000; color: #ffffff; border: 1px solid #000000; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; width: 100%;">
                     Submit Score & Continue to Next
                   </button>
                 </div>

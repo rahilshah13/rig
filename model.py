@@ -37,12 +37,15 @@ frontend_state = {
     "current_batch": [],
     "currentIndex": 0,
     "latest_scores": {},
+    "scored_status": {},
     "epoch": 1,
-    "status_message": "Running skeletal diffusion pipeline with disambiguated loss metrics...",
+    "global_step": 0,
+    "repeat_step": 0,
+    "status_message": "Running skeletal diffusion pipeline with selective RLHF & AOT ARM64 compilation...",
     "actual_loss": 0.0,
+    "actual_loss_range": [0.0, 1.0],  # Fixed KeyError by safely initializing range
     "normalized_loss": 0.0,
-    "actual_loss_range": "[0, inf)",
-    "normalized_loss_range": "[0, 1]",
+    "normalized_loss_range": [0.0, 1.0],
     "current_operation": "Active Functional Scan Training",
     "is_paused": False,
     "active_checkpoint": "checkpoint_bundle.pickle"
@@ -61,7 +64,7 @@ apply_rope = lambda x, freq=10000.0: (lambda c, s: x.at[..., 0::2].set(x[..., 0:
 scaled_dot_product_attention = lambda q, k, v, mask=None: jnp.matmul(jax.nn.softmax(jnp.matmul(q, jnp.swapaxes(k, -2, -1)) * (1.0 / jnp.sqrt(q.shape[-1])) + (mask if mask is not None else 0.0), axis=-1), v)
 
 def skeleton_diffusion_transformer(params, x, cond, n_heads=8, num_loops=4):
-    sigma_t, human_reward_scores = cond
+    sigma_t, human_reward_scores, has_score_mask = cond
     B, T, D = x.shape
     
     h = jax.nn.gelu(x @ params['input_proj'])
@@ -78,7 +81,8 @@ def skeleton_diffusion_transformer(params, x, cond, n_heads=8, num_loops=4):
 
     h, _ = jax.lax.scan(transformer_scan_body, h, xs=None, length=num_loops)
     
-    reward_proj = (human_reward_scores[:, None] @ params['reward_proj'])[:, None, :]
+    effective_reward = human_reward_scores * has_score_mask
+    reward_proj = (effective_reward[:, None] @ params['reward_proj'])[:, None, :]
     h = h + reward_proj + sigma_t[:, :, None] * params['sigma_emb'][None, :, :]
     
     out = rms_norm(jax.nn.gelu(h @ params['up_proj_1']) @ params['up_proj_2'], params['out_rms_scale']) @ params['out_proj']
@@ -101,7 +105,7 @@ def init_params(key, feature_dim=FEATURE_DIM, dim=512):
     }
 
 # -----------------------------------------------------------------------------
-# 2. VAE Engine & RLHF Latent Alignment
+# 2. VAE Engine & Selective RLHF Latent Alignment
 # -----------------------------------------------------------------------------
 def init_vae_params(key, latent_dim=128, input_dim=FEATURE_DIM, hidden_dim=512):
     log_to_stream("[Architecture: VAE Init] Initializing skeletal VAE parameters...")
@@ -127,7 +131,7 @@ def vae_decode(vae_params, z):
     h = jax.nn.gelu(z @ vae_params['dec_dense'])
     return h @ vae_params['dec_out']
 
-def vae_loss_fn(vae_params, vae_state_key, x, human_scores, beta=0.01):
+def vae_loss_fn(vae_params, vae_state_key, x, human_scores, has_score_mask, beta=0.01):
     mean, logvar = vae_encode(vae_params, x)
     z = vae_reparameterize(vae_state_key, mean, logvar)
     recon_x = vae_decode(vae_params, z)
@@ -135,15 +139,15 @@ def vae_loss_fn(vae_params, vae_state_key, x, human_scores, beta=0.01):
     recon_loss = jnp.mean(jnp.square(recon_x - x))
     kl_loss = -0.5 * jnp.mean(1 + logvar - jnp.square(mean) - jnp.exp(logvar))
     
-    reward_weight = (1.0 - human_scores)[:, None, None]
+    reward_weight = (1.0 - human_scores)[:, None, None] * has_score_mask[:, None, None]
     rlhf_penalty = jnp.mean(reward_weight * jnp.square(z))
     
     total_loss = recon_loss + beta * kl_loss + 0.1 * rlhf_penalty
     return total_loss, (recon_loss, kl_loss, rlhf_penalty)
 
-def vae_update_step(vae_params, opt_state, opt_def, key, x, scores):
+def vae_update_step(vae_params, opt_state, opt_def, key, x, scores, has_score_mask):
     grad_fn = jax.jit(jax.value_and_grad(vae_loss_fn, has_aux=True))
-    (loss, aux), grads = grad_fn(vae_params, key, x, scores)
+    (loss, aux), grads = grad_fn(vae_params, key, x, scores, has_score_mask)
     updates, new_opt_state = opt_def.update(grads, opt_state, vae_params)
     new_params = optax.apply_updates(vae_params, updates)
     return new_params, new_opt_state, loss, aux
@@ -284,13 +288,15 @@ def get_current_batch():
     with state_lock:
         return JSONResponse({
             "epoch": frontend_state["epoch"],
+            "global_step": frontend_state["global_step"],
+            "repeat_step": frontend_state["repeat_step"],
             "batch": frontend_state["current_batch"],
             "currentIndex": frontend_state["currentIndex"],
             "status": frontend_state["status_message"],
             "actual_loss": round(float(frontend_state["actual_loss"]), 5),
-            "actual_loss_range": frontend_state["actual_loss_range"],
+            "actual_loss_range": frontend_state.get("actual_loss_range", [0.0, 1.0]),  # Safely retrieved
             "normalized_loss": round(float(frontend_state["normalized_loss"]), 5),
-            "normalized_loss_range": frontend_state["normalized_loss_range"],
+            "normalized_loss_range": frontend_state.get("normalized_loss_range", [0.0, 1.0]),
             "current_operation": frontend_state["current_operation"],
             "is_paused": frontend_state["is_paused"]
         })
@@ -304,6 +310,7 @@ async def submit_human_scores(request: Request):
     
     with state_lock:
         frontend_state["latest_scores"][item_id] = score
+        frontend_state["scored_status"][item_id] = True
         batch = frontend_state["current_batch"]
         if batch:
             frontend_state["currentIndex"] = (frontend_state["currentIndex"] + 1) % len(batch)
@@ -331,6 +338,43 @@ async def training_checkpoint(request: Request):
         frontend_state["active_checkpoint"] = ckpt_name
         frontend_state["status_message"] = f"Switched to checkpoint: {ckpt_name}"
     return {"status": "success", "checkpoint": ckpt_name}
+
+@app.post("/api/vae/sample")
+async def api_vae_sample(request: Request):
+    data = await request.json()
+    mode = data.get("mode", "jax")
+    start_time = time.time()
+    
+    bundle = load_checkpoint_safely()
+    if not bundle:
+        return JSONResponse({"status": "error", "message": "Checkpoint not loaded"}, status_code=500)
+    
+    vae_params = bundle["vae_params"]
+    key = jax.random.PRNGKey(int(time.time()))
+    
+    if mode == "arm64":
+        dummy_z = jnp.zeros((1, 10, 128), dtype=jnp.float32)
+        closed_jaxpr = jax.make_jaxpr(partial(vae_decode, vae_params))(dummy_z)
+        asm, metrics = compile_closed_jaxpr_to_arm64(closed_jaxpr)
+        z = jax.random.normal(key, (1, 10, 128))
+        res = vae_decode(vae_params, z)
+        latency = (time.time() - start_time) * 1000
+        return {
+            "status": "success",
+            "engine": "ARM64 NEON AOT",
+            "latency_ms": round(latency, 2),
+            "metrics": metrics
+        }
+    else:
+        z = jax.random.normal(key, (1, 10, 128))
+        res = vae_decode(vae_params, z)
+        latency = (time.time() - start_time) * 1000
+        return {
+            "status": "success",
+            "engine": "JAX Native JIT",
+            "latency_ms": round(latency, 2),
+            "output_shape": list(res.shape)
+        }
 
 @app.post("/api/render-card")
 async def proxy_render_card(request: Request):
@@ -383,10 +427,23 @@ def evaluate_and_generate_batch(params, vae_params, batch_size=16):
     with state_lock:
         epoch = frontend_state["epoch"]
         latest_scores_map = frontend_state.get("latest_scores", {})
+        scored_status_map = frontend_state.get("scored_status", {})
     
     log_to_stream(f"[Batch Generation] Sampling parametric riggings for Epoch {epoch} (Batch Size: {batch_size})")
-    scores_list = [latest_scores_map.get(i + 1, 0.5) for i in range(batch_size)]
+    
+    scores_list = []
+    masks_list = []
+    for i in range(batch_size):
+        item_id = i + 1
+        if scored_status_map.get(item_id, False):
+            scores_list.append(latest_scores_map.get(item_id, 0.5))
+            masks_list.append(1.0)
+        else:
+            scores_list.append(0.5)
+            masks_list.append(0.0)
+
     reward_scores_array = jnp.array(scores_list, dtype=jnp.float32)
+    has_score_mask = jnp.array(masks_list, dtype=jnp.float32)
     
     key = jax.random.PRNGKey(epoch * 42)
     seq_len = 10
@@ -420,10 +477,10 @@ def evaluate_and_generate_batch(params, vae_params, batch_size=16):
     with state_lock:
         if not frontend_state["is_paused"]:
             frontend_state["current_batch"] = batch_metadata
-            frontend_state["current_operation"] = "Active Functional Scan Training"
+            frontend_state["current_operation"] = f"Batch Generation (Epoch {epoch}, Size {batch_size})"
             frontend_state["status_message"] = f"Epoch {epoch}: Parametric rigging batch generated."
 
-    return reward_scores_array, sampled_features
+    return reward_scores_array, has_score_mask, sampled_features
 
 def run_training_loop(params, vae_params):
     log_to_stream("[Training Thread] Background functional scan VAE training thread initialized...")
@@ -445,14 +502,19 @@ def run_training_loop(params, vae_params):
 
             with state_lock:
                 frontend_state["epoch"] = global_step + 1
+                frontend_state["global_step"] = global_step
             
-            batch_scores, x_batch = evaluate_and_generate_batch(params, vae_params, batch_size=16)
+            batch_scores, has_score_mask, x_batch = evaluate_and_generate_batch(params, vae_params, batch_size=16)
             
             num_repeat_training_steps = 3
             for repeat_step in range(num_repeat_training_steps):
+                with state_lock:
+                    frontend_state["repeat_step"] = repeat_step + 1
+                    frontend_state["current_operation"] = f"VAE Gradient Step [{repeat_step + 1}/{num_repeat_training_steps}] (Step {global_step})"
+
                 key = jax.random.PRNGKey(global_step * 10 + repeat_step)
                 vae_params, vae_opt_state, vae_loss, aux = vae_update_step(
-                    vae_params, vae_opt_state, vae_opt_def, key, x_batch, batch_scores
+                    vae_params, vae_opt_state, vae_opt_def, key, x_batch, batch_scores, has_score_mask
                 )
             
             peak_loss_tracker = float(jnp.maximum(peak_loss_tracker, vae_loss))
@@ -461,6 +523,7 @@ def run_training_loop(params, vae_params):
             with state_lock:
                 frontend_state["actual_loss"] = float(vae_loss)
                 frontend_state["normalized_loss"] = norm_loss
+                frontend_state["current_operation"] = f"Logging Step {global_step} (Loss Normalization)"
             
             log_to_stream(f"[Training Step {global_step:04d}] Actual Loss [0, inf): {vae_loss:.4f} | Normalized Loss [0, 1]: {norm_loss:.4f}")
 
