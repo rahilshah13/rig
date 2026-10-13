@@ -15,9 +15,15 @@ jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", False)
 
 CONCURRENT_MODELS = 3
-CURR_CKPT, PREV_CKPT = "checkpoints/checkpoint_bundle.pickle", "checkpoints/checkpoint_bundle_prev.pickle"
-CKPT_LOCK_PATH = "checkpoints/checkpoint.lock"
-INIT_SEED_PATH = "checkpoints/init_seed.lock"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
+os.makedirs(CHECKPOINT_DIR, exist_ok=True, mode=0o777)
+
+CURR_CKPT = os.path.join(CHECKPOINT_DIR, "checkpoint_bundle.pickle")
+PREV_CKPT = os.path.join(CHECKPOINT_DIR, "checkpoint_bundle_prev.pickle")
+CKPT_LOCK_PATH = os.path.join(CHECKPOINT_DIR, "checkpoint.lock")
+INIT_SEED_PATH = os.path.join(CHECKPOINT_DIR, "init_seed.lock")
 
 RENDER_SERVICE_URL = "http://localhost:8001"
 
@@ -43,7 +49,7 @@ frontend_state = {
     "repeat_step": 0,
     "status_message": "Running skeletal diffusion pipeline with selective RLHF & AOT ARM64 compilation...",
     "actual_loss": 0.0,
-    "actual_loss_range": [0.0, 1.0],  # Fixed KeyError by safely initializing range
+    "actual_loss_range": [0.0, 1.0],
     "normalized_loss": 0.0,
     "normalized_loss_range": [0.0, 1.0],
     "current_operation": "Active Functional Scan Training",
@@ -283,6 +289,24 @@ def load_checkpoint_safely(path=CURR_CKPT):
             fcntl.flock(clf, fcntl.LOCK_UN)
         return res
 
+def save_checkpoint_safely(bundle_data, path=CURR_CKPT):
+    temp_path = path + ".tmp"
+    with open(CKPT_LOCK_PATH, "a+") as clf:
+        fcntl.flock(clf, fcntl.LOCK_EX)
+        try:
+            with open(temp_path, "wb") as f:
+                pickle.dump(bundle_data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, path)
+            log_to_stream(f"[Checkpoint] Successfully saved checkpoint bundle to {path}")
+        except Exception as e:
+            log_to_stream(f"[Checkpoint] Error saving checkpoint: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        finally:
+            fcntl.flock(clf, fcntl.LOCK_UN)
+
 @app.get("/api/batch")
 def get_current_batch():
     with state_lock:
@@ -294,7 +318,7 @@ def get_current_batch():
             "currentIndex": frontend_state["currentIndex"],
             "status": frontend_state["status_message"],
             "actual_loss": round(float(frontend_state["actual_loss"]), 5),
-            "actual_loss_range": frontend_state.get("actual_loss_range", [0.0, 1.0]),  # Safely retrieved
+            "actual_loss_range": frontend_state.get("actual_loss_range", [0.0, 1.0]),
             "normalized_loss": round(float(frontend_state["normalized_loss"]), 5),
             "normalized_loss_range": frontend_state.get("normalized_loss_range", [0.0, 1.0]),
             "current_operation": frontend_state["current_operation"],
@@ -343,6 +367,7 @@ async def training_checkpoint(request: Request):
 async def api_vae_sample(request: Request):
     data = await request.json()
     mode = data.get("mode", "jax")
+    scale = float(data.get("scale", 1.0))
     start_time = time.time()
     
     bundle = load_checkpoint_safely()
@@ -352,35 +377,66 @@ async def api_vae_sample(request: Request):
     vae_params = bundle["vae_params"]
     key = jax.random.PRNGKey(int(time.time()))
     
+    z = jax.random.normal(key, (1, 10, 128)) * scale
+    res = vae_decode(vae_params, z)
+    
+    p = res[0, 0, :]
+    bone_transforms = {}
+    param_idx = 0
+    for bone in SKELETAL_BONES:
+        freq = float(jnp.abs(p[param_idx]) * 3.0 + 0.5) if param_idx < p.shape[0] else 1.5
+        amp = float(jnp.abs(p[param_idx + 1]) * 0.6 + 0.1) if param_idx + 1 < p.shape[0] else 0.3
+        axis_val = float(p[param_idx + 2]) if param_idx + 2 < p.shape[0] else 0.0
+        axis = 'x' if axis_val < -0.33 else ('y' if axis_val > 0.33 else 'z')
+        bone_transforms[bone] = {"freq": round(freq, 2), "amp": round(amp, 2), "axis": axis}
+        param_idx += 3
+
+    mass = float(jnp.abs(p[param_idx]) * 50.0 + 50.0) if param_idx < p.shape[0] else 75.0
+    height = float(jnp.abs(p[param_idx + 1]) * 0.5 + 1.5) if param_idx + 1 < p.shape[0] else 1.75
+    animation_duration = int(np.random.randint(4, 31))
+
+    render_payload = {
+        "var_id": 999,
+        "epoch": frontend_state["epoch"],
+        "mass": mass,
+        "height": height,
+        "duration_sec": animation_duration,
+        "bone_transforms": bone_transforms
+    }
+    
+    gif_url = ""
+    try:
+        render_resp = requests.post(f"{RENDER_SERVICE_URL}/api/render-card", json=render_payload, timeout=45)
+        render_data = render_resp.json()
+        if render_data.get("status") == "success":
+            gif_url = render_data.get("video_url", "")
+    except Exception as e:
+        log_to_stream(f"[Inference Render Warning] Could not reach render service: {e}")
+        gif_url = f"/gif/rigged_scene_var_999_epoch_{frontend_state['epoch']}.gif"
+
+    latency = (time.time() - start_time) * 1000
+    metrics = {"peak_registers": 12, "total_regs": 24} if mode == "arm64" else None
+
     if mode == "arm64":
         dummy_z = jnp.zeros((1, 10, 128), dtype=jnp.float32)
         closed_jaxpr = jax.make_jaxpr(partial(vae_decode, vae_params))(dummy_z)
-        asm, metrics = compile_closed_jaxpr_to_arm64(closed_jaxpr)
-        z = jax.random.normal(key, (1, 10, 128))
-        res = vae_decode(vae_params, z)
-        latency = (time.time() - start_time) * 1000
-        return {
-            "status": "success",
-            "engine": "ARM64 NEON AOT",
-            "latency_ms": round(latency, 2),
-            "metrics": metrics
-        }
-    else:
-        z = jax.random.normal(key, (1, 10, 128))
-        res = vae_decode(vae_params, z)
-        latency = (time.time() - start_time) * 1000
-        return {
-            "status": "success",
-            "engine": "JAX Native JIT",
-            "latency_ms": round(latency, 2),
-            "output_shape": list(res.shape)
-        }
+        _, metrics = compile_closed_jaxpr_to_arm64(closed_jaxpr)
+
+    return {
+        "status": "success",
+        "engine": "ARM64 NEON AOT" if mode == "arm64" else "JAX Native JIT",
+        "latency_ms": round(latency, 2),
+        "preview_url": gif_url,
+        "animation_duration_sec": animation_duration,
+        "bone_transforms": bone_transforms,
+        "metrics": metrics
+    }
 
 @app.post("/api/render-card")
 async def proxy_render_card(request: Request):
     body = await request.json()
     try:
-        resp = requests.post(f"{RENDER_SERVICE_URL}/api/render-card", json=body, timeout=30)
+        resp = requests.post(f"{RENDER_SERVICE_URL}/api/render-card", json=body, timeout=45)
         return resp.json()
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -423,32 +479,10 @@ def serve_index():
         return FileResponse("frontend/dist/index.html")
     return JSONResponse({"status": "error", "message": "Frontend not built"}, status_code=504)
 
-def evaluate_and_generate_batch(params, vae_params, batch_size=16):
-    with state_lock:
-        epoch = frontend_state["epoch"]
-        latest_scores_map = frontend_state.get("latest_scores", {})
-        scored_status_map = frontend_state.get("scored_status", {})
-    
-    log_to_stream(f"[Batch Generation] Sampling parametric riggings for Epoch {epoch} (Batch Size: {batch_size})")
-    
-    scores_list = []
-    masks_list = []
-    for i in range(batch_size):
-        item_id = i + 1
-        if scored_status_map.get(item_id, False):
-            scores_list.append(latest_scores_map.get(item_id, 0.5))
-            masks_list.append(1.0)
-        else:
-            scores_list.append(0.5)
-            masks_list.append(0.0)
-
-    reward_scores_array = jnp.array(scores_list, dtype=jnp.float32)
-    has_score_mask = jnp.array(masks_list, dtype=jnp.float32)
-    
-    key = jax.random.PRNGKey(epoch * 42)
-    seq_len = 10
-    random_latent = jax.random.normal(key, (batch_size, seq_len, 128))
-    sampled_features = vae_decode(vae_params, random_latent)
+def initialize_rlhf_buffer(vae_params, batch_size=16):
+    log_to_stream("[RLHF Buffer] Initializing stable evaluation batch buffer...")
+    key = jax.random.PRNGKey(1337)
+    sampled_features = vae_decode(vae_params, jax.random.normal(key, (batch_size, 10, 128)))
     
     batch_metadata = []
     for i in range(batch_size):
@@ -465,34 +499,35 @@ def evaluate_and_generate_batch(params, vae_params, batch_size=16):
 
         mass = float(jnp.abs(p[param_idx]) * 50.0 + 50.0) if param_idx < p.shape[0] else 75.0
         height = float(jnp.abs(p[param_idx + 1]) * 0.5 + 1.5) if param_idx + 1 < p.shape[0] else 1.75
+        animation_duration = int(np.random.randint(4, 31))
 
         batch_metadata.append({
             "id": i + 1,
             "mass": round(mass, 1),
             "height": round(height, 2),
+            "duration_sec": animation_duration,
             "bone_transforms": bone_transforms,
-            "preview_url": f"/gif/rigged_scene_var_{i+1}_epoch_{epoch}.gif"
+            "preview_url": f"/gif/rigged_scene_var_{i+1}_epoch_1.gif"
         })
 
     with state_lock:
-        if not frontend_state["is_paused"]:
-            frontend_state["current_batch"] = batch_metadata
-            frontend_state["current_operation"] = f"Batch Generation (Epoch {epoch}, Size {batch_size})"
-            frontend_state["status_message"] = f"Epoch {epoch}: Parametric rigging batch generated."
-
-    return reward_scores_array, has_score_mask, sampled_features
+        frontend_state["current_batch"] = batch_metadata
 
 def run_training_loop(params, vae_params):
-    log_to_stream("[Training Thread] Background functional scan VAE training thread initialized...")
+    log_to_stream("[Training Thread] Background functional scan VAE training thread initialized (Decoupled from RLHF grading)...")
     global_step = 0
     vae_opt_def = optax.adam(3e-4)
     vae_opt_state = vae_opt_def.init(vae_params)
     peak_loss_tracker = 1.0  
     
+    initialize_rlhf_buffer(vae_params)
+
     try:
         while True:
             with state_lock:
                 paused = frontend_state["is_paused"]
+                latest_scores_map = dict(frontend_state.get("latest_scores", {}))
+                scored_status_map = dict(frontend_state.get("scored_status", {}))
             
             if paused:
                 with state_lock:
@@ -504,7 +539,14 @@ def run_training_loop(params, vae_params):
                 frontend_state["epoch"] = global_step + 1
                 frontend_state["global_step"] = global_step
             
-            batch_scores, has_score_mask, x_batch = evaluate_and_generate_batch(params, vae_params, batch_size=16)
+            scores_list = [latest_scores_map.get(i+1, 0.5) if scored_status_map.get(i+1, False) else 0.5 for i in range(16)]
+            masks_list = [1.0 if scored_status_map.get(i+1, False) else 0.0 for i in range(16)]
+            
+            reward_scores_array = jnp.array(scores_list, dtype=jnp.float32)
+            has_score_mask = jnp.array(masks_list, dtype=jnp.float32)
+            
+            key = jax.random.PRNGKey(global_step * 42)
+            x_batch = vae_decode(vae_params, jax.random.normal(key, (16, 10, 128)))
             
             num_repeat_training_steps = 3
             for repeat_step in range(num_repeat_training_steps):
@@ -512,9 +554,9 @@ def run_training_loop(params, vae_params):
                     frontend_state["repeat_step"] = repeat_step + 1
                     frontend_state["current_operation"] = f"VAE Gradient Step [{repeat_step + 1}/{num_repeat_training_steps}] (Step {global_step})"
 
-                key = jax.random.PRNGKey(global_step * 10 + repeat_step)
+                step_key = jax.random.PRNGKey(global_step * 10 + repeat_step)
                 vae_params, vae_opt_state, vae_loss, aux = vae_update_step(
-                    vae_params, vae_opt_state, vae_opt_def, key, x_batch, batch_scores, has_score_mask
+                    vae_params, vae_opt_state, vae_opt_def, step_key, x_batch, reward_scores_array, has_score_mask
                 )
             
             peak_loss_tracker = float(jnp.maximum(peak_loss_tracker, vae_loss))
@@ -527,24 +569,26 @@ def run_training_loop(params, vae_params):
             
             log_to_stream(f"[Training Step {global_step:04d}] Actual Loss [0, inf): {vae_loss:.4f} | Normalized Loss [0, 1]: {norm_loss:.4f}")
 
+            if global_step % 5 == 0:
+                save_checkpoint_safely({"params": params, "vae_params": vae_params}, CURR_CKPT)
+
             global_step += 1
             time.sleep(0.1)
     except Exception as e:
         log_to_stream(f"[Training Loop Error] {e}")
 
 if __name__ == "__main__":
-    os.makedirs("data", exist_ok=True)
-    os.makedirs("checkpoints", exist_ok=True)
-    
     with open(CKPT_LOCK_PATH, "a+") as clf:
         fcntl.flock(clf, fcntl.LOCK_EX)
         try:
             clf.seek(0)
-            if not os.path.exists(CURR_CKPT) or os.path.getsize(CURR_CKPT) == 0:
-                log_to_stream("[Main] Initializing scan-optimized skeletal checkpoint bundle...")
+            if os.path.exists(CURR_CKPT) and os.path.getsize(CURR_CKPT) > 0:
+                log_to_stream("[Startup Status] Training using found checkpoints: resuming from existing checkpoint bundle.")
+            else:
+                log_to_stream("[Startup Status] No checkpoint found: initializing fresh parameters and continuing training from scratch.")
                 init_p = init_params(jax.random.PRNGKey(42))
                 init_vae_p = init_vae_params(jax.random.PRNGKey(43))
-                pickle.dump({"params": init_p, "vae_params": init_vae_p}, open(CURR_CKPT, "wb"))
+                save_checkpoint_safely({"params": init_p, "vae_params": init_vae_p}, CURR_CKPT)
         finally:
             fcntl.flock(clf, fcntl.LOCK_UN)
 

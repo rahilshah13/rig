@@ -32,7 +32,7 @@ function RigCanvas(props) {
 
       ctx.save();
       ctx.translate(canvasRef.width / 2, canvasRef.height / 2 + 10);
-      ctx.scale(1.35, -1.35);
+      ctx.scale(1.0, -1.0);
 
       const transforms = props.transforms || {};
       const computedPositions = {};
@@ -69,7 +69,7 @@ function RigCanvas(props) {
       Object.keys(computedPositions).forEach(bone => {
         const p = computedPositions[bone];
         ctx.beginPath();
-        ctx.arc(p[0], p[1], 3.0, 0, 2 * Math.PI);
+        ctx.arc(p[0], p[1], 2.8, 0, 2 * Math.PI);
         ctx.fill();
         ctx.stroke();
       });
@@ -84,8 +84,8 @@ function RigCanvas(props) {
   onCleanup(() => cancelAnimationFrame(animationFrameId));
 
   return (
-    <div style="width: 190px; height: 190px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);">
-      <canvas ref={canvasRef} width="190" height="190" style="transform: scale(1.0); transform-origin: center; display: block;" />
+    <div style="width: 100%; height: 100%; min-height: 200px; max-height: 240px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; box-sizing: border-box;">
+      <canvas ref={canvasRef} width="280" height="240" style="width: 100%; height: 100%; object-fit: contain; display: block;" />
     </div>
   );
 }
@@ -126,7 +126,7 @@ function App() {
     },
     currentScore: 0.5,
     showModal: false,
-    viewMode: "gif",
+    viewMode: "rig",
     preset: "isometric",
     url: "",
     isRendering: false,
@@ -141,60 +141,54 @@ function App() {
     isInferencing: false
   });
 
+  onMount(() => {
+    document.title = "RigStudio";
+  });
+
   const fetchData = async () => {
     if (!state.isPaused) {
       try {
         const res = await fetch("/api/batch");
+        if (!res.ok) throw new Error(`HTTP status ${res.status}`);
         const data = await res.json();
         if (data) setState("batchData", data);
       } catch (err) {
-        console.error("Batch fetch error:", err);
+        console.error("Batch fetch error / server disconnected:", err);
       }
     }
   };
 
   onMount(() => {
     fetchData();
-    const interval = setInterval(fetchData, 1000);
+    const interval = setInterval(fetchData, 2000);
     onCleanup(() => clearInterval(interval));
   });
 
   const togglePause = async () => {
     const nextState = !state.isPaused;
     setState("isPaused", nextState);
-    await fetch("/api/training/control", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: nextState ? "pause" : "resume" })
-    });
+    try {
+      await fetch("/api/training/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: nextState ? "pause" : "resume" })
+      });
+    } catch (err) {
+      console.error("Training control error:", err);
+    }
   };
 
   const handleCheckpointChange = async (e) => {
     const ckpt = e.target.value;
     setState("selectedCheckpoint", ckpt);
-    await fetch("/api/training/checkpoint", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ checkpoint: ckpt })
-    });
-  };
-
-  const sampleVaeEngine = async (mode) => {
-    setState("vaeSamplingMode", mode);
-    setState("isSamplingVae", true);
     try {
-      const res = await fetch("/api/vae/sample", {
+      await fetch("/api/training/checkpoint", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode })
+        body: JSON.stringify({ checkpoint: ckpt })
       });
-      const data = await res.json();
-      setState("vaeSamplingResult", data);
     } catch (err) {
-      console.error("VAE sampling error:", err);
-      setState("vaeSamplingResult", { status: "error", message: err.toString() });
-    } finally {
-      setState("isSamplingVae", false);
+      console.error("Checkpoint switch error:", err);
     }
   };
 
@@ -218,7 +212,7 @@ function App() {
 
   const switchView = async (mode, selectedPreset = "isometric") => {
     setState("viewMode", mode);
-    if (mode === "gif") return;
+    if (mode === "rig") return;
     setState("preset", selectedPreset);
     const batch = state.batchData.batch;
     const item = batch[state.batchData.currentIndex];
@@ -226,9 +220,9 @@ function App() {
 
     setState("isRendering", true);
     let endpoint = "/api/render-card";
-    let payload = { var_id: item.id, epoch: state.batchData.epoch, preset: selectedPreset };
-    if (mode === "pc") { endpoint = "/api/render-pointcloud"; payload = { var_id: item.id, epoch: state.batchData.epoch }; }
-    else if (mode === "opengl") { endpoint = "/api/render-opengl"; payload = { var_id: item.id, epoch: state.batchData.epoch }; }
+    let payload = { var_id: item.id, epoch: state.batchData.epoch, preset: selectedPreset, duration_sec: item.duration_sec || 6, bone_transforms: item.bone_transforms };
+    if (mode === "pc") { endpoint = "/api/render-pointcloud"; }
+    else if (mode === "opengl") { endpoint = "/api/render-opengl"; }
 
     try {
       const res = await fetch(endpoint, {
@@ -250,58 +244,53 @@ function App() {
     const item = batch[state.batchData.currentIndex];
     if (!item) return;
 
-    await fetch("/api/score", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ item_id: item.id, score: state.currentScore })
-    });
+    try {
+      await fetch("/api/score", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item_id: item.id, score: state.currentScore })
+      });
+    } catch (err) {
+      console.error("Score submit error:", err);
+    }
 
     setState({
       currentScore: 0.5,
       url: "",
-      viewMode: "gif"
+      viewMode: "rig"
     });
     fetchData();
   };
 
   return (
-    <div style="font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #0f172a; height: 100vh; max-height: 100vh; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 12px 16px; box-sizing: border-box;">
-      <div style="width: 100%; max-width: 1100px; display: flex; flex-direction: column; align-items: center; text-align: center; height: 100%; gap: 10px;">
+    <div style="font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #0f172a; height: 100vh; max-height: 100vh; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 8px 12px; box-sizing: border-box;">
+      <div style="width: 100%; max-width: 1100px; display: flex; flex-direction: column; align-items: center; text-align: center; height: 100%; gap: 6px; box-sizing: border-box;">
         
-        {/* Header & Control Toolbar */}
-        <div style="display: flex; justify-content: space-between; align-items: center; width: 100%; background: #ffffff; padding: 10px 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); box-sizing: border-box;">
-          <h1 style="font-size: 14px; font-weight: 800; color: #0f172a; margin: 0; text-transform: uppercase; letter-spacing: 0.5px;">Rig Stream - Store State</h1>
-          <div style="display: flex; gap: 8px; align-items: center;">
-            <select value={state.selectedCheckpoint} onChange={handleCheckpointChange} style="font-size: 11px; padding: 4px 8px; border-radius: 6px; border: 1px solid #e2e8f0; background: #f8fafc; color: #0f172a; cursor: pointer;">
-              <option value="checkpoint_bundle.pickle">Latest Bundle</option>
-              <option value="checkpoint_bundle_prev.pickle">Previous Bundle</option>
-            </select>
-            <button onClick={togglePause} style={`padding: 5px 12px; border-radius: 6px; border: none; font-size: 11px; font-weight: 700; cursor: pointer; background: ${state.isPaused ? '#0f172a' : '#f1f5f9'}; color: ${state.isPaused ? '#ffffff' : '#0f172a'};`}>
-              {state.isPaused ? "Resume Training" : "Pause Training"}
-            </button>
-            <button onClick={() => setState("showModal", true)} style="padding: 5px 12px; background: #f1f5f9; color: #0f172a; border: none; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer;">
-              ℹ️ Objectives
-            </button>
-          </div>
+        {/* Header */}
+        <div style="display: flex; justify-content: space-between; align-items: center; width: 100%; background: #ffffff; padding: 8px 14px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); box-sizing: border-box;">
+          <h1 style="font-size: 13px; font-weight: 800; color: #0f172a; margin: 0; text-transform: uppercase; letter-spacing: 0.5px;">RigStudio</h1>
+          <button onClick={() => setState("showModal", true)} style="padding: 4px 10px; background: #f1f5f9; color: #0f172a; border: none; border-radius: 6px; font-size: 10px; font-weight: 700; cursor: pointer;">
+            ℹ️ Objectives
+          </button>
         </div>
 
-        {/* Status & Disambiguated Loss Dashboard */}
-        <div style="background: #ffffff; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); color: #0f172a; padding: 10px 16px; border-radius: 8px; font-size: 11px; font-weight: 600; display: flex; flex-direction: column; gap: 4px; width: 100%; box-sizing: border-box;">
+        {/* Status & Loss Dashboard */}
+        <div style="background: #ffffff; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); color: #0f172a; padding: 6px 14px; border-radius: 8px; font-size: 10px; font-weight: 600; display: flex; flex-direction: column; gap: 2px; width: 100%; box-sizing: border-box;">
           <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
             <span><strong>Operation:</strong> {state.batchData.current_operation || "Initializing..."}</span>
             <span><strong>Epoch:</strong> {state.batchData.epoch}</span>
           </div>
-          <div style="display: flex; justify-content: space-around; width: 100%; border-top: 1px solid #f1f5f9; padding-top: 4px; font-size: 10px;">
-            <span>Actual Loss <span style="color:#64748b;">[0, inf)</span>: <strong style="color: #0f172a;">{state.batchData.actual_loss ?? 0.0000}</strong></span>
-            <span>Normalized Loss <span style="color:#64748b;">[0, 1]</span>: <strong style="color: #0f172a;">{state.batchData.normalized_loss ?? 0.0000}</strong></span>
+          <div style="display: flex; justify-content: space-around; width: 100%; border-top: 1px solid #f1f5f9; padding-top: 2px;">
+            <span>Actual Loss: <strong style="color: #0f172a;">{state.batchData.actual_loss ?? 0.0000}</strong></span>
+            <span>Normalized Loss: <strong style="color: #0f172a;">{state.batchData.normalized_loss ?? 0.0000}</strong></span>
           </div>
         </div>
 
-        {/* Main Content Area: 2/3 RLHF Component & 1/3 Inference Component Grid */}
+        {/* Main Content Area */}
         {state.batchData.batch.length === 0 ? (
-          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; background: #ffffff; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); width: 100%; flex-grow: 1; box-sizing: border-box;">
-            <div style="width: 28px; height: 28px; border: 3px solid #0f172a; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 8px;"></div>
-            <p style="font-size: 13px; color: #0f172a; font-weight: 700;">Streaming procedural variation from JAX VAE...</p>
+          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 30px; background: #ffffff; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); width: 100%; flex-grow: 1; box-sizing: border-box;">
+            <div style="width: 24px; height: 24px; border: 3px solid #0f172a; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 6px;"></div>
+            <p style="font-size: 12px; color: #0f172a; font-weight: 700;">Streaming procedural variation from JAX VAE...</p>
             <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
           </div>
         ) : (
@@ -312,26 +301,27 @@ function App() {
             if (!item) return null;
 
             return (
-              <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 16px; width: 100%; flex-grow: 1; align-items: stretch; box-sizing: border-box; text-align: left;">
+              <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px; width: 100%; flex-grow: 1; min-height: 0; align-items: stretch; box-sizing: border-box; text-align: left;">
                 
-                {/* Left Column: RLHF Grading Component (2/3 Width) */}
-                <div style="background: #ffffff; padding: 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); display: flex; flex-direction: column; justify-content: space-between; color: #0f172a; box-sizing: border-box;">
+                {/* Left Column: RLHF Grading Component */}
+                <div style="background: #ffffff; padding: 12px 14px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); display: flex; flex-direction: column; justify-content: space-between; color: #0f172a; box-sizing: border-box; height: 100%;">
                   
-                  <div style="display: flex; flex-direction: column; gap: 6px; width: 100%;">
+                  <div style="display: flex; flex-direction: column; gap: 4px; width: 100%;">
                     <div style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
-                      <h3 style="font-size: 13px; font-weight: 700; margin: 0;">Variation #{item.id} (Item {idx + 1} of {batch.length})</h3>
-                      <div style="display: flex; gap: 4px;">
-                        <button onClick={() => switchView("gif")} style={`font-size: 10px; padding: 3px 8px; border-radius: 4px; border: none; background: ${state.viewMode === 'gif' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'gif' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>GIF</button>
-                        <button onClick={() => switchView("2d", state.preset)} style={`font-size: 10px; padding: 3px 8px; border-radius: 4px; border: none; background: ${state.viewMode === '2d' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === '2d' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>2D</button>
-                        <button onClick={() => switchView("pc")} style={`font-size: 10px; padding: 3px 8px; border-radius: 4px; border: none; background: ${state.viewMode === 'pc' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'pc' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>PC</button>
-                        <button onClick={() => switchView("opengl")} style={`font-size: 10px; padding: 3px 8px; border-radius: 4px; border: none; background: ${state.viewMode === 'opengl' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'opengl' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>GL</button>
+                      <h3 style="font-size: 12px; font-weight: 700; margin: 0;">Variation #{item.id} (Item {idx + 1} of {batch.length})</h3>
+                      <div style="display: flex; gap: 3px;">
+                        <button onClick={() => switchView("rig")} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; background: ${state.viewMode === 'rig' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'rig' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>RIG</button>
+                        <button onClick={() => switchView("gif", "isometric")} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; background: ${state.viewMode === 'gif' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'gif' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>GIF</button>
+                        <button onClick={() => switchView("2d", state.preset)} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; background: ${state.viewMode === '2d' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === '2d' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>2D</button>
+                        <button onClick={() => switchView("pc")} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; background: ${state.viewMode === 'pc' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'pc' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>PC</button>
+                        <button onClick={() => switchView("opengl")} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; background: ${state.viewMode === 'opengl' ? '#0f172a' : '#f1f5f9'}; color: ${state.viewMode === 'opengl' ? '#ffffff' : '#0f172a'}; cursor: pointer; font-weight: bold;`}>GL</button>
                       </div>
                     </div>
                     
                     <div style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
-                      <p style="font-size: 11px; color: #64748b; margin: 0;">Mass: <strong>{item.mass}kg</strong> | Height: <strong>{item.height}m</strong></p>
+                      <p style="font-size: 10px; color: #64748b; margin: 0;">Mass: <strong>{item.mass}kg</strong> | Height: <strong>{item.height}m</strong> | Length: <strong>{item.duration_sec || 6}s</strong></p>
                       {state.viewMode === "2d" && (
-                        <select value={state.preset} onChange={(e) => switchView("2d", e.target.value)} style="font-size: 10px; padding: 3px 6px; border-radius: 4px; border: 1px solid #e2e8f0; background: #f8fafc; color: #0f172a;">
+                        <select value={state.preset} onChange={(e) => switchView("2d", e.target.value)} style="font-size: 9px; padding: 2px 4px; border-radius: 4px; border: 1px solid #e2e8f0; background: #f8fafc; color: #0f172a;">
                           <option value="isometric">Isometric</option>
                           <option value="cinematic">Cinematic</option>
                           <option value="front">Front</option>
@@ -341,117 +331,112 @@ function App() {
                     </div>
                   </div>
 
-                  {/* Perfectly Fitted Render & Rig Viewports (No Over-Zooming) */}
-                  <div style="display: flex; gap: 16px; width: 100%; justify-content: center; align-items: center; margin: 8px 0;">
-                    <div style="display: flex; flex-direction: column; align-items: center;">
-                      <span style="font-size: 10px; font-weight: 700; margin-bottom: 4px; text-transform: uppercase; color: #64748b;">Bone Rig</span>
+                  {/* Fully Filled Viewport Container */}
+                  <div style="display: flex; width: 100%; flex-grow: 1; align-items: center; justify-content: center; margin: 6px 0; overflow: hidden; box-sizing: border-box;">
+                    {state.viewMode === 'rig' ? (
                       <RigCanvas transforms={item.bone_transforms} />
-                    </div>
-                    <div style="display: flex; flex-direction: column; align-items: center;">
-                      <span style="font-size: 10px; font-weight: 700; margin-bottom: 4px; text-transform: uppercase; color: #64748b;">{state.viewMode.toUpperCase()} Viewport</span>
-                      {state.viewMode === 'gif' ? (
-                        item.preview_url ? (
-                          <div style="width: 190px; height: 190px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);">
-                            <img src={item.preview_url} alt="Mesh Render" style="width: 190px; height: 190px; object-fit: contain; transform: scale(1.0); transform-origin: center; display: block;" />
+                    ) : state.viewMode === 'gif' ? (
+                      <div style="width: 100%; height: 100%; min-height: 200px; max-height: 240px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #000000; border-radius: 6px; box-sizing: border-box;">
+                        <video controls autoplay loop src={item.preview_url} style="width: 100%; height: 100%; object-fit: contain; display: block;" />
+                      </div>
+                    ) : (
+                      state.isRendering ? (
+                        <div style="width: 100%; height: 100%; min-height: 200px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 10px;">Rendering...</div>
+                      ) : (
+                        state.url ? (
+                          <div style="width: 100%; height: 100%; min-height: 200px; max-height: 240px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #000000; border-radius: 6px; box-sizing: border-box;">
+                            <video controls autoplay loop src={state.url} style="width: 100%; height: 100%; object-fit: contain; display: block;" />
                           </div>
                         ) : (
-                          <div style="width: 190px; height: 190px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 11px;">Rendering...</div>
+                          <div style="width: 100%; height: 100%; min-height: 200px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 10px;">Ready</div>
                         )
-                      ) : (
-                        state.isRendering ? (
-                          <div style="width: 190px; height: 190px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 11px;">Rendering...</div>
-                        ) : (
-                          state.url ? (
-                            <div style="width: 190px; height: 190px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #000000; border-radius: 6px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);">
-                              <video controls autoplay loop src={state.url} style="width: 190px; height: 190px; object-fit: contain; transform: scale(1.0); transform-origin: center; display: block;" />
-                            </div>
-                          ) : (
-                            <div style="width: 190px; height: 190px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 11px;">Ready</div>
-                          )
-                        )
-                      )}
-                    </div>
+                      )
+                    )}
                   </div>
 
-                  <div style="width: 100%; display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 11px; font-weight: 700; display: flex; justify-content: space-between;">
+                  <div style="width: 100%; display: flex; flex-direction: column; gap: 4px;">
+                    <label style="font-size: 10px; font-weight: 700; display: flex; justify-content: space-between;">
                       <span>Score Reward:</span>
                       <span>{state.currentScore}</span>
                     </label>
                     <input type="range" min="0" max="1" step="0.1" value={state.currentScore} 
                       onInput={(e) => setState("currentScore", parseFloat(e.target.value))} 
-                      style="width: 100%; cursor: pointer; accent-color: #0f172a; height: 16px;" />
+                      style="width: 100%; cursor: pointer; accent-color: #0f172a; height: 14px;" />
                     
-                    <button onClick={submitScoreAndNext} style="margin-top: 4px; padding: 10px 14px; background: #0f172a; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; width: 100%; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);">
+                    <button onClick={submitScoreAndNext} style="margin-top: 2px; padding: 8px 12px; background: #0f172a; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; width: 100%; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);">
                       Submit Score & Continue
                     </button>
                   </div>
 
                 </div>
 
-                {/* Right Column: Functional Inference Component (1/3 Width) */}
-                <div style="background: #ffffff; padding: 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); display: flex; flex-direction: column; justify-content: space-between; color: #0f172a; box-sizing: border-box;">
+                {/* Right Column: Inference Component */}
+                <div style="background: #ffffff; padding: 12px 14px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04); display: flex; flex-direction: column; justify-content: space-between; color: #0f172a; box-sizing: border-box; height: 100%;">
                   
-                  <div style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
+                  <div style="display: flex; flex-direction: column; gap: 6px; width: 100%;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                      <h3 style="font-size: 13px; font-weight: 700; margin: 0; text-transform: uppercase;">Inference Playground</h3>
-                      <div style="display: flex; gap: 4px;">
-                        <button onClick={() => sampleVaeEngine("jax")} style={`font-size: 10px; padding: 3px 8px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; background: ${state.vaeSamplingMode === 'jax' ? '#0f172a' : '#f1f5f9'}; color: ${state.vaeSamplingMode === 'jax' ? '#ffffff' : '#0f172a'};`}>JAX</button>
-                        <button onClick={() => sampleVaeEngine("arm64")} style={`font-size: 10px; padding: 3px 8px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; background: ${state.vaeSamplingMode === 'arm64' ? '#0f172a' : '#f1f5f9'}; color: ${state.vaeSamplingMode === 'arm64' ? '#ffffff' : '#0f172a'};`}>ARM64 AOT</button>
+                      <h3 style="font-size: 12px; font-weight: 700; margin: 0; text-transform: uppercase;">Inference</h3>
+                      <div style="display: flex; gap: 3px;">
+                        <button onClick={() => setState("vaeSamplingMode", "jax")} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; background: ${state.vaeSamplingMode === 'jax' ? '#0f172a' : '#f1f5f9'}; color: ${state.vaeSamplingMode === 'jax' ? '#ffffff' : '#0f172a'};`}>JAX</button>
+                        <button onClick={() => setState("vaeSamplingMode", "arm64")} style={`font-size: 9px; padding: 2px 6px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; background: ${state.vaeSamplingMode === 'arm64' ? '#0f172a' : '#f1f5f9'}; color: ${state.vaeSamplingMode === 'arm64' ? '#ffffff' : '#0f172a'};`}>ARM64</button>
                       </div>
                     </div>
 
-                    <div style="display: flex; flex-direction: column; gap: 4px;">
-                      <label style="font-size: 11px; font-weight: 700; display: flex; justify-content: space-between;">
-                        <span>Latent Scale Factor:</span>
+                    <div style="display: flex; flex-direction: column; gap: 2px;">
+                      <label style="font-size: 10px; font-weight: 700; display: flex; justify-content: space-between;">
+                        <span>Latent Scale:</span>
                         <span>{state.inferenceLatentScale}x</span>
                       </label>
                       <input type="range" min="0.1" max="3.0" step="0.1" value={state.inferenceLatentScale}
                         onInput={(e) => setState("inferenceLatentScale", parseFloat(e.target.value))}
-                        style="width: 100%; cursor: pointer; accent-color: #0f172a; height: 16px;" />
+                        style="width: 100%; cursor: pointer; accent-color: #0f172a; height: 14px;" />
                     </div>
 
-                    <div style="display: flex; flex-direction: column; gap: 4px;">
-                      <label style="font-size: 11px; font-weight: 700; display: flex; justify-content: space-between;">
+                    <div style="display: flex; flex-direction: column; gap: 2px;">
+                      <label style="font-size: 10px; font-weight: 700; display: flex; justify-content: space-between;">
                         <span>Sampling Steps:</span>
                         <span>{state.inferenceStepCount}</span>
                       </label>
                       <input type="range" min="1" max="50" step="1" value={state.inferenceStepCount}
                         onInput={(e) => setState("inferenceStepCount", parseInt(e.target.value))}
-                        style="width: 100%; cursor: pointer; accent-color: #0f172a; height: 16px;" />
+                        style="width: 100%; cursor: pointer; accent-color: #0f172a; height: 14px;" />
                     </div>
                   </div>
 
-                  <div style="background: #f8fafc; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 6px; min-height: 120px; justify-content: center; box-sizing: border-box; margin: 12px 0;">
-                    <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #64748b;">Inference Telemetry</div>
-                    {state.isInferencing || state.isSamplingVae ? (
-                      <div style="display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 600;">
+                  {/* Inference Preview Box */}
+                  <div style="background: #f8fafc; border-radius: 6px; padding: 6px; display: flex; flex-direction: column; gap: 4px; align-items: center; justify-content: center; box-sizing: border-box; margin: 4px 0; min-height: 90px; flex-grow: 1;">
+                    {state.isInferencing ? (
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 10px; font-weight: 600; color: #64748b;">
                         <div style="width: 14px; height: 14px; border: 2px solid #0f172a; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite;"></div>
-                        <span>Executing {state.vaeSamplingMode.toUpperCase()} forward pass...</span>
+                        <span>Rendering asset...</span>
                       </div>
-                    ) : state.inferenceResult || state.vaeSamplingResult ? (
-                      (() => {
-                        const res = state.inferenceResult || state.vaeSamplingResult;
-                        return (
-                          <div style="font-size: 11px; display: flex; flex-direction: column; gap: 3px; text-align: left;">
-                            <div>Engine: <strong>{res.engine || (state.vaeSamplingMode === 'arm64' ? 'ARM64 NEON AOT' : 'JAX Native JIT')}</strong></div>
-                            <div>Latency: <strong>{res.latency_ms || 0} ms</strong></div>
-                            <div>Status: <strong style="color: #10b981;">{res.status}</strong></div>
-                            {res.metrics && (
-                              <div style="font-family: monospace; font-size: 10px; color: #64748b;">
-                                Peak Regs: {res.metrics.peak_registers} | Total Regs: {res.metrics.total_regs}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()
+                    ) : (state.inferenceResult && state.inferenceResult.preview_url) ? (
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 2px; width: 100%; height: 100%;">
+                        {state.inferenceResult.preview_url.endsWith('.mp4') ? (
+                          <video controls autoplay loop src={state.inferenceResult.preview_url} style="width: 100%; height: 85px; object-fit: contain; background: #000000; border-radius: 6px;" />
+                        ) : (
+                          <img src={state.inferenceResult.preview_url} alt="Sampled Preview" style="width: 100%; height: 85px; object-fit: contain; background: #ffffff; border-radius: 6px;" />
+                        )}
+                        <div style="font-size: 9px; color: #64748b;">{state.inferenceResult.latency_ms}ms ({state.inferenceResult.engine})</div>
+                      </div>
                     ) : (
-                      <div style="font-size: 11px; color: #64748b;">Configure parameters above and execute inference to test model convergence.</div>
+                      <div style="font-size: 10px; color: #64748b; text-align: center; padding: 4px;">Execute inference to test model convergence.</div>
                     )}
                   </div>
 
-                  <button onClick={runFunctionalInference} style="margin-top: 4px; padding: 10px 14px; background: #0f172a; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; width: 100%; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);">
-                    Execute Functional Inference
+                  {/* Checkpoint & Pause/Resume Control (Located at the bottom of the inference panel) */}
+                  <div style="display: flex; gap: 6px; align-items: center; justify-content: space-between; background: #f8fafc; padding: 5px 8px; border-radius: 6px; border: 1px solid #e2e8f0; margin-bottom: 4px; box-sizing: border-box;">
+                    <select value={state.selectedCheckpoint} onChange={handleCheckpointChange} style="font-size: 9px; padding: 3px 4px; border-radius: 4px; border: 1px solid #e2e8f0; background: #ffffff; color: #0f172a; cursor: pointer; flex-grow: 1;">
+                      <option value="checkpoint_bundle.pickle">Latest Bundle</option>
+                      <option value="checkpoint_bundle_prev.pickle">Previous Bundle</option>
+                    </select>
+                    <button onClick={togglePause} style={`padding: 3px 8px; border-radius: 4px; border: none; font-size: 9px; font-weight: 700; cursor: pointer; background: ${state.isPaused ? '#0f172a' : '#e2e8f0'}; color: ${state.isPaused ? '#ffffff' : '#0f172a'};`}>
+                      {state.isPaused ? "Resume" : "Pause"}
+                    </button>
+                  </div>
+
+                  <button onClick={runFunctionalInference} style="padding: 8px 12px; background: #0f172a; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; width: 100%; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);">
+                    Inference
                   </button>
 
                 </div>
